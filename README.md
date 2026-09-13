@@ -2,7 +2,7 @@
 
 **Stop animated emotes from restarting when the same emote is posted again.**
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/greasyfork-v1.6.0-red.svg)](https://greasyfork.org/)
 [![Installs](https://img.shields.io/badge/installs-0-green.svg)](#)
 
@@ -53,7 +53,7 @@ User scripts put you in control of your browsing experience. Once installed, the
 
    *(Note: If you are using the Tampermonkey extension in a Chrome-based browser, follow [these instructions](https://www.tampermonkey.net/faq.php#Q209) to enable Developer Mode.)*
 
-2. Install this script by visiting Greasy Fork: `[link to your script]`
+2. Install this script by visiting Greasy Fork: `(https://greasyfork.org/en/scripts/595615-twitch-emote-no-restart)`
 
 ### Manual Installation
 
@@ -117,11 +117,6 @@ Please include:
 - The exact emote(s) that misbehaved (if known)
 - What you expected vs. what happened
 
-### Submitting Pull Requests
+### Support Author
 
-1. **Fork the repository:** Click on the "Fork" button in the top-right of the repo.
-
-2. **Clone your fork:**
-   ```bash
-   git clone https://github.com/YOUR-USERNAME/Twitch-Emote-No-Restart.git
-   cd Twitch-Emote-No-Restart
+If you like this script, you can support me [via [Ko-fi](https://ko-fi.com/) or [Buy me a coffee ☕]([https://buymeacoffee.com/](https://ko-fi.com/sirsane2k)).](https://ko-fi.com/sirsane2k)
