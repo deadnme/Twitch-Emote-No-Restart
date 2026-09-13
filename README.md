@@ -1,4 +1,4 @@
-#Overview
+# Overview
 
 This userscript fixes a long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat.
 
