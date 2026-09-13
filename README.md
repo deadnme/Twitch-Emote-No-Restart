@@ -120,4 +120,4 @@ Please include:
 
 ## Support Author
 
-If you like this script, you can support me by buying me a coffee ☕: [Buy me a coffee ☕](https://ko-fi.com/sirsane2k)
+If you like this script, you can [buy me a coffee ☕](https://ko-fi.com/sirsane2k)
