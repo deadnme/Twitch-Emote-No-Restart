@@ -117,6 +117,7 @@ Please include:
 - The exact emote(s) that misbehaved (if known)
 - What you expected vs. what happened
 
-### Support Author
 
-If you like this script, you can support me [via [Ko-fi](https://ko-fi.com/) or [Buy me a coffee ☕]([https://buymeacoffee.com/](https://ko-fi.com/sirsane2k)).](https://ko-fi.com/sirsane2k)
+## Support Author
+
+If you like this script, you can support me by buying me a coffee ☕: [Buy me a coffee ☕](https://ko-fi.com/sirsane2k)
