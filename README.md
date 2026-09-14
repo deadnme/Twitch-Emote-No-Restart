@@ -71,10 +71,10 @@ No configuration is needed. The script:
 
 ### Supported Emote Providers
 
-- **Twitch** — `static-cdn.jtvnw.net/emoticons/v2/...`
-- **7TV** — `cdn.7tv.app/emote/...` and `cdn.7tv.io/emote/...`
-- **BetterTTV** — `cdn.betterttv.net/emote/...`
-- **FrankerFaceZ** — `cdn.frankerfacez.com/emote/...`
+- **Twitch** 
+- **7TV** 
+- **BetterTTV** 
+- **FrankerFaceZ** 
 
 ### Supported Browsers
 
