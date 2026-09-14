@@ -3,7 +3,7 @@
 **Stop animated emotes from restarting when the same emote is posted again.**
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Greasy Fork](https://img.shields.io/badge/greasyfork-v1.9.9-red.svg)](https://greasyfork.org/)
+[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.0.0-red.svg)](https://greasyfork.org/)
 
 
 ---
