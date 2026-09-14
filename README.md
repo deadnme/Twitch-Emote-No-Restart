@@ -59,13 +59,13 @@ User scripts put you in control of your browsing experience. Once installed, the
 
 1. Install a user script manager (see list above).
 
-2. Open the Tampermonkey/Violentmonkey Dashboard, drag & drop `twitch-emote-no-restart.user.js` into it, and click the **Install** button.
+2. Open the Tampermonkey/Violentmonkey Dashboard, search `twitch-emote-no-restart`, and click the **Install script** button.
 
 ---
 
 ## How to Use
 
-This script works automatically once installed. Just visit [twitch.tv](https://www.twitch.tv/) and open any chat with animated emotes.
+This script works automatically once installed. Just visit [twitch.tv](https://www.twitch.tv/) or hard-refresh your browser (ctrl + shift + R) and open any stream with animated emotes.
 
 No configuration is needed. The script:
 
@@ -101,7 +101,7 @@ The script runs silently by default. If you want to verify it's working, open **
 
 ## Contributing
 
-We welcome contributions from the community! If you'd like to contribute to Twitch Emote No-Restart, follow these steps:
+I welcome contributions from the community! If you'd like to contribute to Twitch Emote No-Restart, follow these steps:
 
 ### Reporting Issues
 
