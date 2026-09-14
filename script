@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Emote No-Restart
 // @namespace    twitch-emote-no-restart
-// @version      1.9.9
+// @version      1.9.10
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
 // @author       Sirsane2k
 // @license      GNU GPLv3
@@ -56,6 +56,13 @@
 
   function isChatEmote(imgEl) {
     if (imgEl.closest('[data-a-target="chat-line-message"]')) return true;
+    // FrankerFaceZ (including its built-in 7TV-emotes addon) renders chat
+    // emotes with its own markup that doesn't carry Twitch's native
+    // data-a-target attribute at all. Its emote <img> elements do still
+    // carry a "chat-line"-ish class though (e.g. "chat-line__message--emote"),
+    // so fall back to that rather than relying solely on Twitch's own
+    // native attribute, or FFZ-rendered emotes get silently ignored.
+    if (imgEl.closest('[class*="chat-line"]')) return true;
     const scroller = getChatScroller();
     return !!(scroller && scroller.contains(imgEl));
   }
