@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/greasyfork-v1.9.1-red.svg)](https://greasyfork.org/)
-[![Installs](https://img.shields.io/badge/installs-0-green.svg)](#)
+
 
 ---
 
