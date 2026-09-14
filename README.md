@@ -55,11 +55,6 @@ User scripts put you in control of your browsing experience. Once installed, the
 
 2. Install this script by visiting Greasy Fork: `(https://greasyfork.org/en/scripts/595615-twitch-emote-no-restart)`
 
-### Manual Installation
-
-1. Install a user script manager (see list above).
-
-2. Open the Tampermonkey/Violentmonkey Dashboard, search `twitch-emote-no-restart`, and click the **Install script** button.
 
 ---
 
