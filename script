@@ -1,0 +1,514 @@
+// ==UserScript==
+// @name         Twitch Emote No-Restart
+// @namespace    twitch-emote-no-restart
+// @version      1.9.0
+// @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
+// @author       Sirsane2k
+// @license      GNU GPLv3
+// @match        https://www.twitch.tv/*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @connect      static-cdn.jtvnw.net
+// @connect      cdn.7tv.app
+// @connect      cdn.7tv.io
+// @connect      cdn.betterttv.net
+// @connect      cdn.frankerfacez.com
+// @homepageURL  https://github.com/sirsane2k/Twitch-Emote-No-Restart
+// ==/UserScript==
+ 
+(function () {
+  'use strict';
+ 
+  const CLEANUP_DELAY_MS = 15000;      // how long to keep a decoded emote cached with no visible instances
+  const OCCLUSION_REFRESH_MS = 500;    // elementFromPoint sampling is throttled to this cadence
+  const OCCLUSION_SAMPLES = 5;
+  const OCCLUSION_EDGE_INSET = 0.08;   // keep samples off the exact top/bottom edge to dodge row-seam false positives
+ 
+  const URL_PATTERNS = [
+    { name: 'twitch', re: /static-cdn\.jtvnw\.net\/emoticons\/v2\/([^/]+)\// },
+    { name: '7tv', re: /cdn\.7tv\.(?:app|io)\/emote\/([^/]+)/ },
+    { name: 'bttv', re: /cdn\.betterttv\.net\/emote\/([^/]+)/ },
+    { name: 'ffz', re: /cdn\.frankerfacez\.com\/(?:emote|emoticon)\/(\d+)/ },
+  ];
+ 
+  const STATE_MAP = new Map();   // emote key -> shared decoded animation state
+  const INSTANCES = new Map();   // <img> -> per-instance overlay/canvas bookkeeping
+  let overlayLayer = null;
+ 
+  function ensureOverlayLayer() {
+    if (overlayLayer && document.body.contains(overlayLayer)) return overlayLayer;
+    overlayLayer = document.createElement('div');
+    overlayLayer.id = 'tenr-overlay-layer';
+    Object.assign(overlayLayer.style, {
+      position: 'fixed', top: '0', left: '0', width: '0', height: '0',
+      overflow: 'visible', pointerEvents: 'none', zIndex: '2147483647',
+    });
+    document.body.appendChild(overlayLayer);
+    return overlayLayer;
+  }
+ 
+  // ---- URL helpers --------------------------------------------------
+ 
+  const keyForUrl = (url) => {
+    for (const { name, re } of URL_PATTERNS) {
+      const m = url.match(re);
+      if (m) return `${name}:${m[1]}`;
+    }
+    return null;
+  };
+ 
+  const isCandidateUrl = (url) => !!url && URL_PATTERNS.some(({ re }) => re.test(url));
+ 
+  function bestUrlFor(imgEl) {
+    // Read the srcset/src *attributes* first — they update synchronously
+    // with the DOM mutation that fires our MutationObserver. imgEl.currentSrc
+    // is the browser's own async-resolved "which responsive candidate did I
+    // pick" property and can lag a frame behind on a recycled <img> node,
+    // which was causing us to miss an emote swap (stale key -> wrong cached
+    // animation kept showing, while Twitch's own tooltip — reading
+    // attributes directly — correctly reported the new emote's real name).
+    const srcset = imgEl.getAttribute('srcset');
+    if (srcset) {
+      const candidates = srcset.split(',').map((s) => s.trim().split(/\s+/)[0]).filter(isCandidateUrl);
+      if (candidates.length) return candidates[candidates.length - 1];
+    }
+    const srcAttr = imgEl.getAttribute('src');
+    if (isCandidateUrl(srcAttr)) return srcAttr;
+    if (isCandidateUrl(imgEl.currentSrc)) return imgEl.currentSrc;
+    if (isCandidateUrl(imgEl.src)) return imgEl.src;
+    return null;
+  }
+ 
+  // Live key = the key the DOM *currently* says this <img> should represent.
+  // Used both at attach time and, defensively, every animation frame so a
+  // swap that our MutationObserver failed to notice can never leave a stale
+  // cached emote on screen.
+  function liveKeyFor(imgEl) {
+    const url = bestUrlFor(imgEl);
+    return url ? keyForUrl(url) : null;
+  }
+ 
+  function guessMimeType(url) {
+    if (/\.webp(\?|$)/i.test(url)) return 'image/webp';
+    if (/\.gif(\?|$)/i.test(url)) return 'image/gif';
+    if (/\.png(\?|$)/i.test(url)) return 'image/png';
+    return 'image/webp';
+  }
+ 
+  // Every instance of an emote shares one decode, so always fetch the
+  // largest known size variant for the provider — otherwise whichever
+  // <img> (e.g. a small inline chat image) happens to trigger the decode
+  // first would leave every other instance, including Twitch's own
+  // enlarged hover preview, stuck showing an upscaled/blurry bitmap.
+  function upgradeToHighestQuality(url) {
+    let m = url.match(/^(https:\/\/static-cdn\.jtvnw\.net\/emoticons\/v2\/[^/]+\/[^/]+\/[^/]+\/)[\d.]+$/);
+    if (m) return m[1] + '3.0';
+    m = url.match(/^(https:\/\/cdn\.7tv\.(?:app|io)\/emote\/[^/]+\/)\d+x(\.\w+)?$/);
+    if (m) return m[1] + '4x' + (m[2] || '');
+    m = url.match(/^(https:\/\/cdn\.betterttv\.net\/emote\/[^/]+\/)\d+x$/);
+    if (m) return m[1] + '3x';
+    m = url.match(/^(https:\/\/cdn\.frankerfacez\.com\/(?:emote|emoticon)\/[^/]+\/)\d+(\.\w+)?$/);
+    if (m) return m[1] + '4' + (m[2] || '');
+    return url;
+  }
+ 
+  // ---- Fetch + decode -------------------------------------------------
+ 
+  function fetchArrayBuffer(url) {
+    return fetch(url, { mode: 'cors', credentials: 'omit' })
+      .then((resp) => {
+        if (!resp.ok) throw new Error('bad status ' + resp.status);
+        const type = resp.headers.get('content-type') || guessMimeType(url);
+        return resp.arrayBuffer().then((buf) => ({ buf, type }));
+      })
+      .catch(() => {
+        if (typeof GM_xmlhttpRequest !== 'function') throw new Error('no GM fallback');
+        return new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'GET', url, responseType: 'arraybuffer',
+            onload: (res) => {
+              if (res.status < 200 || res.status >= 300) return reject(new Error('GM status ' + res.status));
+              const ct = (res.responseHeaders || '').match(/content-type:\s*([^\r\n;]+)/i);
+              resolve({ buf: res.response, type: ct ? ct[1].trim() : guessMimeType(url) });
+            },
+            onerror: reject,
+          });
+        });
+      });
+  }
+ 
+  function createState(key, url) {
+    const state = {
+      key, url, frames: null, totalDuration: 0, startTime: performance.now(),
+      loading: true, failed: false, staticOnly: false, refCount: 0, cleanupTimer: null,
+    };
+    STATE_MAP.set(key, state);
+    decodeInto(state);
+    return state;
+  }
+ 
+  async function decodeInto(state) {
+    try {
+      if (typeof ImageDecoder === 'undefined') {
+        state.failed = true; state.loading = false; return;
+      }
+      const { buf, type } = await fetchArrayBuffer(state.url);
+      const decoder = new ImageDecoder({ data: buf, type });
+      await decoder.tracks.ready;
+      const frameCount = (decoder.tracks.selectedTrack && decoder.tracks.selectedTrack.frameCount) || 1;
+ 
+      if (frameCount <= 1) {
+        state.staticOnly = true; state.loading = false;
+        if (decoder.close) decoder.close();
+        return;
+      }
+ 
+      const frames = [];
+      let total = 0;
+      for (let i = 0; i < frameCount; i++) {
+        const { image } = await decoder.decode({ frameIndex: i });
+        const durationMs = image.duration ? image.duration / 1000 : 100;
+        // VideoFrame -> ImageBitmap avoids the pink/white diagonal
+        // corruption some animated WebP/GIFs show when drawn directly.
+        let bitmap;
+        try { bitmap = await createImageBitmap(image); } finally { image.close(); }
+        frames.push({ bitmap, duration: durationMs });
+        total += durationMs;
+      }
+ 
+      if (STATE_MAP.get(state.key) !== state) {
+        frames.forEach((f) => f.bitmap.close && f.bitmap.close());
+        return;
+      }
+      state.frames = frames;
+      state.totalDuration = total || 1;
+      state.startTime = performance.now(); // shared epoch, set exactly once — never touched again
+      state.loading = false;
+      if (decoder.close) decoder.close();
+    } catch (e) {
+      state.failed = true; state.loading = false;
+    }
+  }
+ 
+  function acquireState(key, url) {
+    const state = STATE_MAP.get(key) || createState(key, url);
+    if (state.cleanupTimer) { clearTimeout(state.cleanupTimer); state.cleanupTimer = null; }
+    state.refCount++;
+    return state;
+  }
+ 
+  function releaseState(key) {
+    const state = STATE_MAP.get(key);
+    if (!state) return;
+    state.refCount = Math.max(0, state.refCount - 1);
+    if (state.refCount !== 0) return;
+    state.cleanupTimer = setTimeout(() => {
+      if (STATE_MAP.get(key) === state && state.refCount === 0) {
+        if (state.frames) state.frames.forEach((f) => f.bitmap.close && f.bitmap.close());
+        STATE_MAP.delete(key);
+      }
+    }, CLEANUP_DELAY_MS);
+  }
+ 
+  // ---- Per-<img> instances -------------------------------------------
+ 
+  function attachInstance(imgEl) {
+    if (INSTANCES.has(imgEl)) return;
+    const url = bestUrlFor(imgEl);
+    const key = url && keyForUrl(url);
+    if (!key) return;
+ 
+    const canvas = document.createElement('canvas');
+    canvas.className = 'tenr-canvas';
+    Object.assign(canvas.style, { position: 'fixed', top: '0', left: '0', pointerEvents: 'none', display: 'none' });
+    ensureOverlayLayer().appendChild(canvas);
+ 
+    // occlusionInsets: null = fully covered (hide). {top,bottom} px = partial
+    // crop from those edges. rowRoot: cached "this message's own subtree
+    // root" boundary, used so Twitch's own hover-highlight/reply-button UI
+    // on a message never gets mistaken for a foreign overlay occluding it.
+    INSTANCES.set(imgEl, {
+      canvas, key, hidden: false, clipAncestor: undefined, rowRoot: undefined, occlusionInsets: null,
+    });
+    // acquireState reuses an existing shared state untouched if one already
+    // exists for this key — never re-decodes, never resets startTime, never
+    // disturbs any other instance already animating. That's the core fix.
+    acquireState(key, upgradeToHighestQuality(url));
+  }
+ 
+  function detachInstance(imgEl) {
+    const inst = INSTANCES.get(imgEl);
+    if (!inst) return;
+    inst.canvas.remove();
+    INSTANCES.delete(imgEl);
+    releaseState(inst.key);
+    if (inst.hidden) imgEl.style.opacity = '';
+  }
+ 
+  // Nearest genuinely-scrollable ancestor (the chat message list itself).
+  // Only overflowY auto/scroll counts — plain overflow:hidden is far too
+  // common for unrelated reasons (text truncation, rounded corners) and
+  // would grab some small inner wrapper, clipping emotes down to it.
+  function findScrollClipAncestor(el) {
+    let node = el.parentElement;
+    while (node && node !== document.documentElement) {
+      const cs = getComputedStyle(node);
+      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 1 && node.clientHeight >= 120) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+ 
+  // The top-level child of clipAncestor that contains imgEl — i.e. "this
+  // chat message's own DOM subtree". Anything Twitch draws inside it
+  // (hover highlight, reply button, badges) is not occlusion; anything
+  // outside it (Predict panel, pinned banner, sticky header) is.
+  function findRowRoot(imgEl, clipAncestor) {
+    if (!clipAncestor) return null;
+    let node = imgEl;
+    while (node.parentElement && node.parentElement !== clipAncestor) node = node.parentElement;
+    return node.parentElement === clipAncestor ? node : null;
+  }
+ 
+  // ---- DOM scanning ----------------------------------------------------
+ 
+  function maybeAttach(imgEl) {
+    const url = bestUrlFor(imgEl);
+    if (url && keyForUrl(url)) attachInstance(imgEl);
+  }
+ 
+  function scanNode(node) {
+    if (!(node instanceof Element)) return;
+    if (node.tagName === 'IMG') maybeAttach(node);
+    node.querySelectorAll && node.querySelectorAll('img').forEach(maybeAttach);
+  }
+ 
+  function startObserving() {
+    new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        m.addedNodes && m.addedNodes.forEach(scanNode);
+        m.removedNodes && m.removedNodes.forEach((node) => {
+          if (!(node instanceof Element)) return;
+          if (node.tagName === 'IMG' && INSTANCES.has(node)) detachInstance(node);
+          INSTANCES.forEach((inst, imgEl) => { if (node.contains(imgEl)) detachInstance(imgEl); });
+        });
+        if (m.type === 'attributes' && m.target instanceof HTMLImageElement) {
+          // Twitch sometimes recycles an <img> node in place (new src/srcset).
+          // bestUrlFor reads the src/srcset *attributes* (not currentSrc),
+          // which are guaranteed to be the new values by the time this
+          // callback runs — so the key we derive here matches what the
+          // tooltip will read on hover.
+          const imgEl = m.target;
+          const existing = INSTANCES.get(imgEl);
+          const newKey = liveKeyFor(imgEl);
+          if (existing && (!newKey || existing.key !== newKey)) detachInstance(imgEl);
+          if (newKey && (!existing || existing.key !== newKey)) attachInstance(imgEl);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset'] });
+  }
+ 
+  // ---- Shared animation clock ------------------------------------------
+ 
+  function currentFrameIndex(state, now) {
+    const elapsed = (now - state.startTime) % state.totalDuration;
+    let acc = 0;
+    for (let i = 0; i < state.frames.length; i++) {
+      acc += state.frames[i].duration;
+      if (elapsed < acc) return i;
+    }
+    return state.frames.length - 1;
+  }
+ 
+  // ---- Throttled occlusion (partial-crop, not a boolean) ---------------
+  //
+  // Samples a handful of points down the emote's rect at most twice a
+  // second. Returns how much to inset from the top/bottom, not just
+  // whether "most" of it is covered — a majority-vote boolean was letting
+  // emotes draw in full over a banner whenever less than half the sample
+  // points were covered.
+ 
+  function computeOcclusionInsets(imgEl, rowRoot, rect) {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const x = rect.left + rect.width / 2;
+    if (x < 0 || x >= vw) return { top: 0, bottom: 0 };
+ 
+    const boundary = rowRoot || imgEl;
+    let visTop = null, visBottom = null;
+    for (let i = 0; i < OCCLUSION_SAMPLES; i++) {
+      const frac = OCCLUSION_EDGE_INSET + (1 - 2 * OCCLUSION_EDGE_INSET) * (i / (OCCLUSION_SAMPLES - 1));
+      const y = rect.top + rect.height * frac;
+      if (y < 0 || y >= vh) continue;
+      const hit = document.elementFromPoint(x, y);
+      // "Visible" = hit lands inside this message's own subtree (or is an
+      // ancestor of it, i.e. plain background) — not necessarily on imgEl
+      // itself, so Twitch's own hover-highlight/reply UI within the same
+      // row never gets mistaken for a foreign overlay.
+      const visible = !!hit && (boundary === hit || boundary.contains(hit) || hit.contains(boundary));
+      if (visible) { if (visTop === null) visTop = y; visBottom = y; }
+    }
+    if (visTop === null) return null; // fully occluded
+    return { top: Math.max(0, visTop - rect.top), bottom: Math.max(0, rect.bottom - visBottom) };
+  }
+ 
+  let lastOcclusionCheck = -Infinity;
+  function updateOcclusion(now) {
+    if (now - lastOcclusionCheck < OCCLUSION_REFRESH_MS) return;
+    lastOcclusionCheck = now;
+    const vw = window.innerWidth, vh = window.innerHeight;
+ 
+    for (const [imgEl, inst] of INSTANCES) {
+      if (!document.body.contains(imgEl)) continue;
+      const rect = imgEl.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) { inst.occlusionInsets = null; continue; }
+      if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { inst.occlusionInsets = { top: 0, bottom: 0 }; continue; }
+ 
+      if (inst.clipAncestor === undefined || !document.body.contains(inst.clipAncestor)) inst.clipAncestor = findScrollClipAncestor(imgEl);
+      if (inst.rowRoot === undefined || !document.body.contains(inst.rowRoot)) inst.rowRoot = findRowRoot(imgEl, inst.clipAncestor);
+ 
+      inst.occlusionInsets = computeOcclusionInsets(imgEl, inst.rowRoot, rect);
+    }
+  }
+ 
+  // Combines the scroll-ancestor clip with the occlusion insets into one
+  // CSS clip-path, or null if nothing would remain visible.
+  function computeClipPath(rect, cRect, occlusionInsets) {
+    let top = 0, left = 0, right = 0, bottom = 0;
+    if (cRect) {
+      top = Math.max(top, cRect.top - rect.top);
+      left = Math.max(left, cRect.left - rect.left);
+      right = Math.max(right, rect.right - cRect.right);
+      bottom = Math.max(bottom, rect.bottom - cRect.bottom);
+    }
+    if (occlusionInsets) {
+      top = Math.max(top, occlusionInsets.top);
+      bottom = Math.max(bottom, occlusionInsets.bottom);
+    }
+    if (top + bottom >= rect.height - 0.5 || left + right >= rect.width - 0.5) return null;
+    if (!top && !right && !bottom && !left) return 'none';
+    return `inset(${top}px ${right}px ${bottom}px ${left}px)`;
+  }
+ 
+  // ---- Render loop -------------------------------------------------------
+ 
+  function tick() {
+    const now = performance.now();
+    updateOcclusion(now);
+    const vw = window.innerWidth, vh = window.innerHeight, dpr = window.devicePixelRatio || 1;
+ 
+    // Phase 1 (read-only): batch every getBoundingClientRect() so the
+    // browser does one layout pass instead of thrashing between reads and
+    // the style writes in phase 2.
+    const work = [];
+    for (const [imgEl, inst] of INSTANCES) {
+      if (!document.body.contains(imgEl)) { work.push({ inst, imgEl, action: 'detach' }); continue; }
+ 
+      // Belt-and-suspenders: re-derive the key straight from the DOM every
+      // frame. The MutationObserver already handles the common case, but
+      // Twitch's chat virtualization occasionally mutates src/srcset in a
+      // way that slips past an attribute-filtered observer (e.g. the
+      // attribute is briefly cleared and re-set across task boundaries, or
+      // an unrelated ancestor mutation coalesces the batch). If we ever
+      // miss one, the cached key here is what the canvas is drawing from,
+      // while Twitch's tooltip reads the live DOM — producing the exact
+      // "same visual image, different true name on hover" mismatch that
+      // was reported. Reattaching on divergence costs one extra detach +
+      // attach, so we only do it when the key actually changed.
+      const liveKey = liveKeyFor(imgEl);
+      if (liveKey && liveKey !== inst.key) {
+        work.push({ inst, imgEl, action: 'reattach' });
+        continue;
+      }
+ 
+      const state = STATE_MAP.get(inst.key);
+      if (!state || state.loading || state.failed) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+      if (state.staticOnly) { work.push({ inst, imgEl, action: 'restore' }); continue; } // not animated after all — hand back to Twitch's own <img>
+ 
+      const rect = imgEl.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+      if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+      if (inst.occlusionInsets === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+ 
+      if (inst.clipAncestor === undefined || !document.body.contains(inst.clipAncestor)) inst.clipAncestor = findScrollClipAncestor(imgEl);
+      const cRect = inst.clipAncestor ? inst.clipAncestor.getBoundingClientRect() : null;
+      const clipPath = computeClipPath(rect, cRect, inst.occlusionInsets);
+      if (clipPath === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+ 
+      work.push({ inst, imgEl, action: 'draw', rect, clipPath, state });
+    }
+ 
+    // Phase 2 (write-only).
+    for (const { inst, imgEl, action, rect, clipPath, state } of work) {
+      if (action === 'detach') { detachInstance(imgEl); continue; }
+ 
+      if (action === 'reattach') {
+        // DOM currently advertises a different emote than the one our
+        // canvas is drawing. Drop the stale binding (restoring the <img>
+        // opacity on the way out) and re-bind to the live key. Because
+        // attachInstance reuses the shared STATE_MAP entry, this does not
+        // re-decode anything and does not disturb the animation clock of
+        // any other instance of either emote.
+        detachInstance(imgEl);
+        attachInstance(imgEl);
+        continue;
+      }
+ 
+      if (action === 'hide') {
+        if (inst.canvas.style.display !== 'none') inst.canvas.style.display = 'none';
+        continue;
+      }
+ 
+      if (action === 'restore') {
+        if (inst.canvas.style.display !== 'none') inst.canvas.style.display = 'none';
+        if (inst.hidden) { imgEl.style.opacity = ''; inst.hidden = false; }
+        continue;
+      }
+ 
+      // action === 'draw'
+      const canvas = inst.canvas;
+      if (!inst.hidden) {
+        // opacity, not visibility: visibility:hidden pulls the element out
+        // of hit-testing, which breaks Twitch's own hover tooltip/click.
+        imgEl.style.opacity = '0';
+        inst.hidden = true;
+      }
+ 
+      // Canvas always matches the full emote rect — clipping (scroll
+      // ancestor + occlusion) is pure CSS clip-path, never a resample.
+      canvas.style.transform = `translate3d(${rect.left}px, ${rect.top}px, 0)`;
+      const wPx = rect.width + 'px', hPx = rect.height + 'px';
+      if (canvas.style.width !== wPx) canvas.style.width = wPx;
+      if (canvas.style.height !== hPx) canvas.style.height = hPx;
+      if (canvas.style.clipPath !== clipPath) canvas.style.clipPath = clipPath;
+ 
+      const w = Math.max(1, Math.round(rect.width * dpr));
+      const h = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+ 
+      const frame = state.frames[currentFrameIndex(state, now)].bitmap;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+      try {
+        ctx.drawImage(frame, 0, 0, w, h);
+        if (canvas.style.display !== '') canvas.style.display = '';
+      } catch (e) {
+        // Never show a garbled frame — skip this tick, retry next one.
+        if (canvas.style.display !== 'none') canvas.style.display = 'none';
+      }
+    }
+ 
+    requestAnimationFrame(tick);
+  }
+ 
+  function boot() {
+    ensureOverlayLayer();
+    document.querySelectorAll('img').forEach(maybeAttach);
+    startObserving();
+    requestAnimationFrame(tick);
+  }
+ 
+  document.body ? boot() : document.addEventListener('DOMContentLoaded', boot, { once: true });
+})();
