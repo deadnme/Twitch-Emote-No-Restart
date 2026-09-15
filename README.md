@@ -1,6 +1,7 @@
 # Twitch Emote No-Restart
 
-**Stop animated emotes from restarting when the same emote is posted again.**
+**DISCLAIMER! THIS SCRIPT IS STILL WORK-IN-PROGRESS, BUGS ARE TO BE EXPECTED**
+Stop animated emotes from restarting when the same emote is posted again.
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.2.0-red.svg)](https://greasyfork.org/)
