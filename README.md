@@ -91,12 +91,6 @@ If `ImageDecoder` is unavailable, the script silently disables itself and Twitch
 
 ---
 
-## Check Script Activity
-
-The script runs silently by default. If you want to verify it's working, open **DevTools Console** (F12) and look for messages prefixed with `[TENR]`. You should also notice that animated emotes no longer flicker when spammed.
-
----
-
 ## Contributing
 
 I welcome contributions from the community! If you'd like to contribute to Twitch Emote No-Restart, follow these steps:
