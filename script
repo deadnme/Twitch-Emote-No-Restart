@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Emote No-Restart
 // @namespace    twitch-emote-no-restart
-// @version      1.9.10
+// @version      2.2.0
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
 // @author       Sirsane2k
 // @license      GNU GPLv3
@@ -16,14 +16,32 @@
 // @homepageURL  https://github.com/deadnme/Twitch-Emote-No-Restart
 // ==/UserScript==
 
+// ---------------------------------------------------------------------
+// THE PROBLEM (from the original bug report this script exists to fix):
+// with BTTV/FFZ/7TV all installed, every time an animated emote (SourPls,
+// PepePls, etc.) is posted while another copy is already on screen, ALL
+// copies visibly reset to frame 0 — because each <img> is animating that
+// GIF/WebP/APNG independently via the browser's native image decoder, and
+// Twitch's own DOM churn (new message -> reflow/recycle) restarts them.
+//
+// THE FIX: never let the browser animate the <img> itself. Decode each
+// unique emote once into a plain frame array, keep ONE shared virtual
+// "clock" per emote (an epoch timestamp), and paint that same frame into
+// a canvas laid over every on-screen copy. Adding a new copy only ever
+// reads the existing clock — it can't rewind it, and it can't be rewound
+// by anything Twitch does to the DOM, because the canvases live in a
+// persistent overlay layer on document.body, independent of whatever
+// <img> nodes Twitch creates, destroys, or recycles underneath them.
+// ---------------------------------------------------------------------
+
 (function () {
   'use strict';
 
-  const CLEANUP_DELAY_MS = 15000;      // keep decoded emote cached this long with no visible instances
-  const OCCLUSION_REFRESH_MS = 200;    // idle occlusion sampling cadence
-  const OCCLUSION_DIRTY_MIN_MS = 100;  // fastest re-sample after a UI event marks occlusion dirty
+  const CLEANUP_DELAY_MS = 15000;      // keep a decoded emote cached this long after its last instance disappears
+  const OCCLUSION_REFRESH_MS = 200;    // idle occlusion re-sampling cadence
+  const OCCLUSION_DIRTY_MIN_MS = 100;  // faster re-sample right after a UI event that might have changed layering
   const OCCLUSION_SAMPLES = 5;
-  const OCCLUSION_EDGE_INSET = 0.08;   // keep samples off the exact top/bottom edge
+  const OCCLUSION_EDGE_INSET = 0.08;   // keep samples off the exact top/bottom edge (avoids row-seam false positives)
 
   const URL_PATTERNS = [
     { name: 'twitch', re: /static-cdn\.jtvnw\.net\/emoticons\/v2\/([^/]+)\// },
@@ -36,39 +54,6 @@
   const INSTANCES = new Map();   // <img> -> per-instance canvas/bookkeeping
   let overlayLayer = null;
 
-  // ---- Chat-emote identification --------------------------------------
-  //
-  // Chat emotes live inside the chat message list. Everything else that
-  // renders an emote-shaped <img> (hover previews, emote picker, popovers,
-  // pinned-message strip) lives outside it. We identify chat emotes with
-  // cheap containment checks against attributes Twitch uses on chat
-  // containers, never getComputedStyle, so this never forces layout.
-
-  let chatScroller = null;
-  function getChatScroller() {
-    if (chatScroller && document.body.contains(chatScroller)) return chatScroller;
-    chatScroller =
-      document.querySelector('[data-a-target="chat-scrollable-area__message-container"]') ||
-      document.querySelector('[data-a-target^="chat-scrollable-area"]') ||
-      null;
-    return chatScroller;
-  }
-
-  function isChatEmote(imgEl) {
-    if (imgEl.closest('[data-a-target="chat-line-message"]')) return true;
-    // FrankerFaceZ (including its built-in 7TV-emotes addon) renders chat
-    // emotes with its own markup that doesn't carry Twitch's native
-    // data-a-target attribute at all. Its emote <img> elements do still
-    // carry a "chat-line"-ish class though (e.g. "chat-line__message--emote"),
-    // so fall back to that rather than relying solely on Twitch's own
-    // native attribute, or FFZ-rendered emotes get silently ignored.
-    if (imgEl.closest('[class*="chat-line"]')) return true;
-    const scroller = getChatScroller();
-    return !!(scroller && scroller.contains(imgEl));
-  }
-
-  // ---- Overlay layer --------------------------------------------------
-
   function ensureOverlayLayer() {
     if (overlayLayer && document.body.contains(overlayLayer)) return overlayLayer;
     overlayLayer = document.createElement('div');
@@ -76,13 +61,21 @@
     Object.assign(overlayLayer.style, {
       position: 'fixed', top: '0', left: '0', width: '0', height: '0',
       overflow: 'visible', pointerEvents: 'none',
-      zIndex: '100', // above chat rows, below Twitch's own tooltip layer
+      // Maximal z-index: occlusion/clip-path (below) is what decides
+      // whether something should legitimately cover an emote (a Predict
+      // panel, pinned banner, sticky header), so this no longer needs to
+      // be conservative. A lower z-index here previously put our canvas
+      // *underneath* Twitch's own hover-preview tooltip (itself a
+      // high-z-index popover), leaving animated emotes blank in the
+      // enlarged preview since the real <img> is hidden and our canvas
+      // was invisible behind the tooltip's own background.
+      zIndex: '2147483647',
     });
     document.body.appendChild(overlayLayer);
     return overlayLayer;
   }
 
-  // ---- Emote URL parsing ---------------------------------------------
+  // ---- Emote URL parsing ----------------------------------------------
 
   const keyForUrl = (url) => {
     for (const { name, re } of URL_PATTERNS) {
@@ -95,6 +88,13 @@
   const isCandidateUrl = (url) => !!url && URL_PATTERNS.some(({ re }) => re.test(url));
 
   function bestUrlFor(imgEl) {
+    // Read the srcset/src *attributes* first — they change synchronously
+    // with the DOM mutation that fires our MutationObserver. imgEl.currentSrc
+    // is the browser's own async-resolved "which responsive candidate did I
+    // pick" property and can lag a frame behind on a recycled <img> node,
+    // which previously caused a stale key: our canvas kept showing an old
+    // emote's animation while Twitch's own tooltip (reading attributes
+    // directly) correctly reported the new emote's real name.
     const srcset = imgEl.getAttribute('srcset');
     if (srcset) {
       const candidates = srcset.split(',').map((s) => s.trim().split(/\s+/)[0]).filter(isCandidateUrl);
@@ -119,6 +119,11 @@
     return 'image/webp';
   }
 
+  // Every instance of an emote shares one decode, so always fetch the
+  // largest known size variant for its provider — otherwise whichever
+  // <img> happens to trigger the decode first (often a small inline chat
+  // image) would leave every other instance, including Twitch's own
+  // enlarged hover preview, stuck showing an upscaled/blurry bitmap.
   function upgradeToHighestQuality(url) {
     let m = url.match(/^(https:\/\/static-cdn\.jtvnw\.net\/emoticons\/v2\/[^/]+\/[^/]+\/[^/]+\/)[\d.]+$/);
     if (m) return m[1] + '3.0';
@@ -126,12 +131,10 @@
     if (m) return m[1] + '4x' + (m[2] || '');
     m = url.match(/^(https:\/\/cdn\.betterttv\.net\/emote\/[^/]+\/)\d+x(\.\w+)?$/);
     if (m) return m[1] + '3x' + (m[2] || '');
-    // FFZ animated emotes live under an extra "/animated/" path segment
-    // (e.g. cdn.frankerfacez.com/emote/{id}/animated/{size}.webp) instead
-    // of directly under the id (cdn.frankerfacez.com/emote/{id}/{size}).
-    // The old pattern only matched the static layout, so animated FFZ
-    // emotes silently fell through to `return url` below and never got
-    // upgraded to the highest-quality frame.
+    // FFZ's animated emotes live under an extra "/animated/" path segment
+    // rather than directly under the id — the plain pattern below only
+    // matches static-layout URLs, so without this, animated FFZ emotes
+    // silently fell through to `return url` and never got upgraded.
     m = url.match(/^(https:\/\/cdn\.frankerfacez\.com\/(?:emote|emoticon)\/[^/]+\/animated\/)\d+(\.\w+)?$/);
     if (m) return m[1] + '4' + (m[2] || '.webp');
     m = url.match(/^(https:\/\/cdn\.frankerfacez\.com\/(?:emote|emoticon)\/[^/]+\/)\d+(\.\w+)?$/);
@@ -139,7 +142,7 @@
     return url;
   }
 
-  // ---- Fetch + decode -------------------------------------------------
+  // ---- Fetch + decode ---------------------------------------------------
 
   function fetchArrayBuffer(url) {
     return fetch(url, { mode: 'cors', credentials: 'omit' })
@@ -149,6 +152,8 @@
         return resp.arrayBuffer().then((buf) => ({ buf, type }));
       })
       .catch(() => {
+        // Some CDNs don't send permissive CORS headers to a plain fetch;
+        // GM_xmlhttpRequest is exempt from that, so fall back to it.
         if (typeof GM_xmlhttpRequest !== 'function') throw new Error('no GM fallback');
         return new Promise((resolve, reject) => {
           GM_xmlhttpRequest({
@@ -195,21 +200,24 @@
       for (let i = 0; i < frameCount; i++) {
         const { image } = await decoder.decode({ frameIndex: i });
         const durationMs = image.duration ? image.duration / 1000 : 100;
+        // VideoFrame -> ImageBitmap avoids the pink/white diagonal
+        // corruption some animated WebP/GIFs show when a raw WebCodecs
+        // VideoFrame is drawn straight onto a 2D canvas.
         let bitmap;
         try { bitmap = await createImageBitmap(image); } finally { image.close(); }
         frames.push({ bitmap, duration: durationMs });
         total += durationMs;
       }
 
-      // If the state was discarded while we were decoding (cleanup scan
-      // found no live instances and deleted it), don't resurrect it.
+      // If every instance disappeared (and cleanup deleted this state)
+      // while we were mid-decode, don't resurrect it.
       if (STATE_MAP.get(state.key) !== state) {
         frames.forEach((f) => f.bitmap.close && f.bitmap.close());
         return;
       }
       state.frames = frames;
       state.totalDuration = total || 1;
-      state.startTime = performance.now(); // shared epoch, set exactly once
+      state.startTime = performance.now(); // the shared epoch — set exactly once, ever
       state.loading = false;
       if (decoder.close) decoder.close();
     } catch (e) {
@@ -217,25 +225,23 @@
     }
   }
 
-  // acquireState reuses an existing shared state untouched if one already
-  // exists for this key — never re-decodes, never resets startTime, never
-  // disturbs any other instance already animating.
+  // Reuses an existing shared state untouched if one already exists for
+  // this key. This is the actual fix for the reported bug: it never
+  // re-decodes and never resets startTime, so adding a new on-screen copy
+  // of an emote cannot rewind any existing copy's animation.
   function acquireState(key, url) {
     const state = STATE_MAP.get(key) || createState(key, url);
     if (state.cleanupTimer) { clearTimeout(state.cleanupTimer); state.cleanupTimer = null; }
     return state;
   }
 
-  // Lifecycle is derived from INSTANCES on cleanup, not from a refcount.
-  // An earlier refcount-based design was vulnerable to drift: any code
-  // path that released an instance without re-acquiring (e.g. a reattach
-  // where attachInstance bailed because the node was momentarily outside
-  // the chat scroller) would decrement the counter below the true instance
-  // count. Eventually the counter hit 0 while instances were still
-  // attached, the cleanup timer fired, STATE_MAP.delete ran, and the next
-  // time an instance of that emote was attached a brand-new state was
-  // created with a fresh startTime — resetting every existing instance to
-  // frame 0. Scanning INSTANCES directly makes that impossible.
+  // Lifecycle is derived by scanning INSTANCES at cleanup time, not by a
+  // refcount. A refcount is vulnerable to drift — any path that releases
+  // without a matching acquire eventually hits 0 while instances are
+  // still attached, deleting the state early; the next attach then
+  // creates a *new* state with a fresh startTime, which resets every
+  // still-visible copy back to frame 0. That's indistinguishable from the
+  // original bug this script exists to fix, so it isn't worth risking.
   function releaseState(key) {
     const state = STATE_MAP.get(key);
     if (!state) return;
@@ -251,11 +257,19 @@
     }, CLEANUP_DELAY_MS);
   }
 
-  // ---- Instance attach/detach -----------------------------------------
+  // ---- Instance attach/detach -------------------------------------------
+  //
+  // Deliberately NOT scoped to "chat messages only" via DOM selectors. An
+  // earlier version tried to allowlist chat containers by guessing at
+  // Twitch's attribute/class names, and that allowlist silently broke
+  // whenever a message's actual markup didn't match the guess — the exact
+  // "some emotes just don't show anymore" bug. Any matching emote image
+  // (chat, hover preview, emote picker) gets the same safe treatment, so
+  // there's nothing to get wrong here; the cost is a few extra decodes if
+  // a picker is opened, which is bounded and self-cleans after 15s idle.
 
   function attachInstance(imgEl) {
     if (INSTANCES.has(imgEl)) return;
-    if (!isChatEmote(imgEl)) return;
     const url = bestUrlFor(imgEl);
     const key = url && keyForUrl(url);
     if (!key) return;
@@ -268,17 +282,17 @@
     ctx.imageSmoothingQuality = 'high';
     ensureOverlayLayer().appendChild(canvas);
 
-    // occlusionInsets: undefined = not yet computed (draw unoccluded);
-    // null = fully occluded (hide); {top,bottom} = partial crop.
+    // occlusionInsets: undefined = not yet computed (draw unoccluded this
+    // frame); null = fully occluded (hide); {top,bottom} = partial crop.
     INSTANCES.set(imgEl, {
       canvas, ctx, key, hidden: false,
       clipAncestor: undefined, rowRoot: undefined,
       occlusionInsets: undefined,
       bmpW: 0, bmpH: 0,
-      lastSrcset: undefined, lastSrc: undefined,
-      needsDetach: false,
+      lastSrcset: imgEl.getAttribute('srcset'), lastSrc: imgEl.getAttribute('src'),
     });
     acquireState(key, upgradeToHighestQuality(url));
+    markOcclusionDirty(); // resync this (and every other) instance's occlusion sooner, not on the slower idle cadence
   }
 
   function detachInstance(imgEl) {
@@ -290,18 +304,24 @@
     if (inst.hidden) imgEl.style.opacity = '';
   }
 
+  // Nearest genuinely-scrollable ancestor (the chat message list). Only
+  // overflowY auto/scroll counts — plain overflow:hidden is common for
+  // unrelated reasons (text truncation, rounded corners) and would grab
+  // some small inner wrapper, clipping emotes down to it.
   function findScrollClipAncestor(el) {
     let node = el.parentElement;
     while (node && node !== document.documentElement) {
       const cs = getComputedStyle(node);
-      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && node.clientHeight >= 120) {
-        return node;
-      }
+      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && node.clientHeight >= 120) return node;
       node = node.parentElement;
     }
     return null;
   }
 
+  // The top-level child of clipAncestor that contains imgEl — i.e. "this
+  // chat message's own DOM subtree". Anything Twitch draws inside it (a
+  // hover highlight, reply button, badges) is not occlusion; anything
+  // outside it (a Predict panel, pinned banner, sticky header) is.
   function findRowRoot(imgEl, clipAncestor) {
     if (!clipAncestor) return null;
     let node = imgEl;
@@ -309,10 +329,9 @@
     return node.parentElement === clipAncestor ? node : null;
   }
 
-  // ---- DOM scanning ---------------------------------------------------
+  // ---- DOM scanning ------------------------------------------------------
 
   function maybeAttach(imgEl) {
-    if (!isChatEmote(imgEl)) return;
     const url = bestUrlFor(imgEl);
     if (url && keyForUrl(url)) attachInstance(imgEl);
   }
@@ -336,31 +355,23 @@
           const imgEl = m.target;
           const existing = INSTANCES.get(imgEl);
           const newKey = liveKeyFor(imgEl);
-          // Only tear down/rebuild when the src/srcset change resolves to
-          // a *different, recognized* emote key. Third-party extensions
-          // (7TV/BTTV/FFZ) commonly rewrite src/srcset to blob:/data: URLs
-          // once they've cached-decoded an emote client-side; those don't
-          // match our CDN patterns, so newKey comes back null even though
-          // the emote itself hasn't changed. Previously `!newKey` alone
-          // was enough to detach — tearing down an already-synced,
-          // already-animating instance and re-creating it from scratch
-          // (fresh decode, fresh startTime) purely because the underlying
-          // <img> got a URL we don't recognize. That's the "same emote
-          // isn't synced" / "existing emote restarts" bug: our canvas
-          // overlay already sits on top of the native <img>, so what the
-          // native element's src points to afterward doesn't matter.
-          if (newKey && existing && existing.key !== newKey) {
-            detachInstance(imgEl);
-            attachInstance(imgEl);
-          } else if (newKey && !existing) {
-            attachInstance(imgEl);
-          }
+          // Only tear down/rebuild when src/srcset resolves to a
+          // *different, recognized* emote key. Third-party extensions
+          // commonly rewrite src/srcset to blob:/data: URLs once they've
+          // cached a decoded emote client-side; that doesn't match our
+          // CDN patterns, so newKey comes back null even though the emote
+          // itself hasn't changed. Treating "unrecognized" as "detach" was
+          // tearing down already-synced, already-animating instances for
+          // no reason — our canvas already sits on top of the native
+          // <img>, so what its src points to afterward doesn't matter.
+          if (newKey && existing && existing.key !== newKey) { detachInstance(imgEl); attachInstance(imgEl); }
+          else if (newKey && !existing) attachInstance(imgEl);
         }
       }
     }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset'] });
   }
 
-  // ---- Shared animation clock -----------------------------------------
+  // ---- Shared animation clock ---------------------------------------------
 
   function currentFrameIndex(state, now) {
     const elapsed = (now - state.startTime) % state.totalDuration;
@@ -372,7 +383,13 @@
     return state.frames.length - 1;
   }
 
-  // ---- Occlusion ------------------------------------------------------
+  // ---- Occlusion (partial-crop, not a boolean) ----------------------------
+  //
+  // Samples a handful of points down the emote's own rect, throttled to a
+  // few times a second. Returns how much to inset from the top/bottom, not
+  // just whether "most" of it is covered — a majority-vote boolean lets an
+  // emote draw in full over a banner whenever less than half the sample
+  // points happen to be covered.
 
   function computeOcclusionInsets(imgEl, rowRoot, rect) {
     const vw = window.innerWidth, vh = window.innerHeight;
@@ -386,16 +403,20 @@
       const y = rect.top + rect.height * frac;
       if (y < 0 || y >= vh) continue;
       const hit = document.elementFromPoint(x, y);
+      // "Visible" = hit lands inside this element's own row subtree (or is
+      // an ancestor of it, i.e. plain background) — not necessarily on
+      // imgEl itself, so Twitch's own hover-highlight/reply-button UI
+      // within the same row is never mistaken for a foreign overlay.
       const visible = !!hit && (boundary === hit || boundary.contains(hit) || hit.contains(boundary));
       if (visible) { if (visTop === null) visTop = y; visBottom = y; }
     }
-    if (visTop === null) return null;
+    if (visTop === null) return null; // fully occluded
     return { top: Math.max(0, visTop - rect.top), bottom: Math.max(0, rect.bottom - visBottom) };
   }
 
   let lastOcclusionCheck = -Infinity;
   let occlusionDirty = false;
-  function markOcclusionDirty() { occlusionDirty = true; }
+  const markOcclusionDirty = () => { occlusionDirty = true; };
 
   function updateOcclusion(now) {
     const minInterval = occlusionDirty ? OCCLUSION_DIRTY_MIN_MS : OCCLUSION_REFRESH_MS;
@@ -406,25 +427,20 @@
 
     for (const [imgEl, inst] of INSTANCES) {
       if (!document.body.contains(imgEl)) continue;
-
-      if (!isChatEmote(imgEl)) { inst.needsDetach = true; continue; }
-      inst.needsDetach = false;
-
       const rect = imgEl.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) { inst.occlusionInsets = null; continue; }
       if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { inst.occlusionInsets = { top: 0, bottom: 0 }; continue; }
 
-      if (!inst.clipAncestor || !document.body.contains(inst.clipAncestor)) {
-        inst.clipAncestor = findScrollClipAncestor(imgEl);
-      }
+      if (!inst.clipAncestor || !document.body.contains(inst.clipAncestor)) inst.clipAncestor = findScrollClipAncestor(imgEl);
       if (inst.rowRoot === undefined || (inst.rowRoot && !document.body.contains(inst.rowRoot))) {
         inst.rowRoot = findRowRoot(imgEl, inst.clipAncestor);
       }
-
       inst.occlusionInsets = computeOcclusionInsets(imgEl, inst.rowRoot, rect);
     }
   }
 
+  // Combines the scroll-ancestor clip with the occlusion insets into one
+  // CSS clip-path, or null if nothing would remain visible.
   function computeClipPath(rect, cRect, insets) {
     let top = 0, left = 0, right = 0, bottom = 0;
     if (cRect) {
@@ -442,76 +458,85 @@
     return `inset(${top}px ${right}px ${bottom}px ${left}px)`;
   }
 
-  // ---- Render loop ----------------------------------------------------
+  // ---- Render loop ---------------------------------------------------------
 
   function tick() {
     const now = performance.now();
     updateOcclusion(now);
     const vw = window.innerWidth, vh = window.innerHeight;
 
+    // Phase 1 (read-only): batch every getBoundingClientRect() up front so
+    // the browser does one layout pass instead of thrashing between reads
+    // and the style writes in phase 2.
     const work = [];
     for (const [imgEl, inst] of INSTANCES) {
-      if (!document.body.contains(imgEl) || inst.needsDetach) {
-        work.push({ inst, imgEl, action: 'detach' });
-        continue;
-      }
+      if (!document.body.contains(imgEl)) { work.push({ inst, imgEl, action: 'detach' }); continue; }
 
+      // Cheap per-frame safety net alongside the MutationObserver: if
+      // src/srcset changed since we last checked and it resolves to a
+      // *different* known emote, resync. Reading two attributes here is
+      // far cheaper than a getComputedStyle call, so this runs unthrottled.
       const ss = imgEl.getAttribute('srcset');
       const sa = imgEl.getAttribute('src');
       if (ss !== inst.lastSrcset || sa !== inst.lastSrc) {
-        inst.lastSrcset = ss;
-        inst.lastSrc = sa;
+        inst.lastSrcset = ss; inst.lastSrc = sa;
         const liveKey = liveKeyFor(imgEl);
-        if (liveKey && liveKey !== inst.key) {
-          work.push({ inst, imgEl, action: 'reattach' });
-          continue;
-        }
+        if (liveKey && liveKey !== inst.key) { work.push({ inst, imgEl, action: 'reattach' }); continue; }
       }
 
       const state = STATE_MAP.get(inst.key);
       if (!state || state.loading || state.failed) { work.push({ inst, imgEl, action: 'hide' }); continue; }
-      if (state.staticOnly) { work.push({ inst, imgEl, action: 'restore' }); continue; }
+      if (state.staticOnly) { work.push({ inst, imgEl, action: 'restore' }); continue; } // not animated after all — hand back to Twitch's own <img>
 
       const rect = imgEl.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) { work.push({ inst, imgEl, action: 'hide' }); continue; }
       if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
-      const insets = inst.occlusionInsets === undefined ? { top: 0, bottom: 0 } : inst.occlusionInsets;
+      // A brand-new instance hasn't had an occlusion pass run for it yet
+      // (occlusionInsets is still undefined). Fall back to the native
+      // <img> rather than assuming "not occluded" and drawing at full
+      // size/position — during fast-moving chat, many instances attach in
+      // the same burst, and defaulting to "fully visible" was letting
+      // each one draw unclipped for up to ~200ms, which looked like
+      // emotes briefly overlapping before self-correcting.
+      if (inst.occlusionInsets === undefined) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+      const insets = inst.occlusionInsets;
       if (insets === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
-      const cRect = (inst.clipAncestor && document.body.contains(inst.clipAncestor))
-        ? inst.clipAncestor.getBoundingClientRect() : null;
+      const cRect = (inst.clipAncestor && document.body.contains(inst.clipAncestor)) ? inst.clipAncestor.getBoundingClientRect() : null;
       const clipPath = computeClipPath(rect, cRect, insets);
       if (clipPath === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
       work.push({ inst, imgEl, action: 'draw', rect, clipPath, state, now });
     }
 
+    // Phase 2 (write-only).
     for (const { inst, imgEl, action, rect, clipPath, state, now: frameNow } of work) {
       if (action === 'detach') { detachInstance(imgEl); continue; }
       if (action === 'reattach') { detachInstance(imgEl); attachInstance(imgEl); continue; }
 
-      if (action === 'hide') {
-        if (inst.canvas.style.display !== 'none') inst.canvas.style.display = 'none';
-        // Fall back to the native <img> rather than leaving the emote
-        // fully invisible (canvas hidden + native opacity:0). This only
-        // matters if a state ever legitimately disappears out from under
-        // a live instance; it's a safety net, not the primary fix.
-        if (inst.hidden) { imgEl.style.opacity = ''; inst.hidden = false; }
-        continue;
-      }
-      if (action === 'restore') {
+      if (action === 'hide' || action === 'restore') {
+        // Always fall back to the native <img> instead of leaving a blank
+        // hole. A state can legitimately fail to load (network hiccup,
+        // unsupported format) or become temporarily unavailable — showing
+        // Twitch's own (unsynced, but visible) rendering beats invisible.
         if (inst.canvas.style.display !== 'none') inst.canvas.style.display = 'none';
         if (inst.hidden) { imgEl.style.opacity = ''; inst.hidden = false; }
         continue;
       }
 
+      // action === 'draw'
       const canvas = inst.canvas;
       if (!inst.hidden) {
+        // opacity, not visibility: visibility:hidden pulls the element out
+        // of hit-testing, which breaks Twitch's own hover tooltip/click.
         imgEl.style.opacity = '0';
         inst.hidden = true;
       }
 
+      // The canvas's CSS box always matches the full emote rect; clipping
+      // (scroll ancestor + occlusion) is pure CSS clip-path, never a
+      // resample. Position/size via transform+CSS px is cheap every frame.
       canvas.style.transform = `translate3d(${rect.left}px, ${rect.top}px, 0)`;
       const wPx = rect.width + 'px', hPx = rect.height + 'px';
       if (canvas.style.width !== wPx) canvas.style.width = wPx;
@@ -520,21 +545,29 @@
 
       const frame = state.frames[currentFrameIndex(state, frameNow)].bitmap;
 
-      const bmpW = frame.width, bmpH = frame.height;
-      if (inst.bmpW !== bmpW || inst.bmpH !== bmpH) {
-        canvas.width = bmpW;
-        canvas.height = bmpH;
-        inst.bmpW = bmpW;
-        inst.bmpH = bmpH;
+      // Canvas pixel buffer only needs to match the decoded bitmap's own
+      // resolution (rare to change) — CSS width/height above handles
+      // scaling to the on-screen size every frame without touching (and
+      // clearing) the backing pixel buffer on every tick.
+      if (inst.bmpW !== frame.width || inst.bmpH !== frame.height) {
+        canvas.width = frame.width;
+        canvas.height = frame.height;
+        inst.bmpW = frame.width;
+        inst.bmpH = frame.height;
       }
 
       const ctx = inst.ctx;
-      ctx.clearRect(0, 0, bmpW, bmpH);
+      ctx.clearRect(0, 0, inst.bmpW, inst.bmpH);
       try {
         ctx.drawImage(frame, 0, 0);
         if (canvas.style.display !== '') canvas.style.display = '';
       } catch (e) {
-        if (canvas.style.display !== 'none') canvas.style.display = 'none';
+        // Never show a garbled/blank frame — hide the canvas AND restore
+        // the native <img> so the emote stays visible (just unsynced)
+        // rather than disappearing entirely if this keeps failing.
+        canvas.style.display = 'none';
+        imgEl.style.opacity = '';
+        inst.hidden = false;
       }
     }
 
