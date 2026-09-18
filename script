@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Emote No-Restart
 // @namespace    twitch-emote-no-restart
-// @version      2.2.0
+// @version      2.4.2
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
 // @author       Sirsane2k
 // @license      GNU GPLv3
@@ -14,6 +14,8 @@
 // @connect      cdn.betterttv.net
 // @connect      cdn.frankerfacez.com
 // @homepageURL  https://github.com/deadnme/Twitch-Emote-No-Restart
+// @downloadURL https://update.greasyfork.org/scripts/595615/Twitch%20Emote%20No-Restart.user.js
+// @updateURL https://update.greasyfork.org/scripts/595615/Twitch%20Emote%20No-Restart.meta.js
 // ==/UserScript==
 
 // ---------------------------------------------------------------------
@@ -32,16 +34,73 @@
 // by anything Twitch does to the DOM, because the canvases live in a
 // persistent overlay layer on document.body, independent of whatever
 // <img> nodes Twitch creates, destroys, or recycles underneath them.
+//
+// v2.3.0 / v2.4.0 / v2.4.1: occlusion (pinned Predict banner, pinned chat
+// message, sticky header ...) via elementFromPoint sampling + a scan for
+// pointer-events:none overlays; immediate native-<img> hide for repeat
+// instances; self-occlusion / invisible-wrapper / bogus-duration fixes.
+//
+// v2.4.2: fixes emotes lagging behind during very fast chat. Nothing about
+// decoding, image quality, the shared clock or occlusion *results* changed
+// — only how often and when the expensive work runs.
+//   (1) The occlusion sweep was effectively running a FULL re-sample of
+//       every emote on every frame in fast chat: every DOM mutation,
+//       scroll, transitionend and animationend set the dirty flag, and a
+//       dirty sweep bypassed the "hasn't moved, keep cached insets" check
+//       (the opposite of what its comment said). That is 5 forced
+//       elementFromPoint hit-tests per emote per frame. Now:
+//         - an emote whose rect moved is re-sampled that same frame (so a
+//           row scrolling up under the pinned message is clipped exactly
+//           as before, with no delay);
+//         - a FULL re-sample of stationary emotes only happens when
+//           something OUTSIDE the chat rows changed (a banner / pinned
+//           message mounting, a popover, a resize), capped at one per
+//           OCCLUSION_DIRTY_MIN_MS, plus a safety-net full sweep every
+//           OCCLUSION_REFRESH_MS. New chat messages only move rows, which
+//           the per-emote move check already handles.
+//   (2) Our own canvases being appended to the overlay layer triggered the
+//       MutationObserver, which marked the sweep dirty on every attach.
+//       Mutations inside our overlay layer are now ignored.
+//   (3) The pointer-events overlay scan did querySelectorAll('*') plus
+//       getComputedStyle on the ENTIRE page in a single frame once a
+//       second — a periodic hitch that grows with chat size. It is now
+//       time-sliced (OVERLAY_SCAN_BUDGET_MS per frame). Same checks, same
+//       results, spread over a few frames.
+//   (4) attachInstance forced a synchronous layout (getBoundingClientRect
+//       + elementFromPoint) inside the MutationObserver callback, between
+//       DOM writes — N forced layouts for a burst of N emotes. That check
+//       never made the canvas appear sooner (drawing only happens in
+//       tick(), which always runs before the next paint), so the new
+//       instance's occlusion is now computed in tick()'s read phase.
+//   (5) Removed chat rows were checked against EVERY tracked instance with
+//       contains(). Now only the <img>s inside the removed subtree are
+//       looked up.
+//   (6) Every canvas was cleared + redrawn every frame even when the
+//       shared clock was still on the same frame. The redraw is skipped
+//       when the frame index hasn't changed (pixels are identical).
 // ---------------------------------------------------------------------
 
 (function () {
   'use strict';
 
   const CLEANUP_DELAY_MS = 15000;      // keep a decoded emote cached this long after its last instance disappears
-  const OCCLUSION_REFRESH_MS = 200;    // idle occlusion re-sampling cadence
-  const OCCLUSION_DIRTY_MIN_MS = 100;  // faster re-sample right after a UI event that might have changed layering
+  const OCCLUSION_REFRESH_MS = 200;    // safety-net FULL re-sample of every on-screen emote
+  const OCCLUSION_DIRTY_MIN_MS = 50;   // min gap between event-triggered FULL re-samples (moved emotes are always re-sampled immediately)
   const OCCLUSION_SAMPLES = 5;
   const OCCLUSION_EDGE_INSET = 0.08;   // keep samples off the exact top/bottom edge (avoids row-seam false positives)
+
+  // Supplementary detection for overlays that elementFromPoint can't see
+  // because they (or a wrapper) set pointer-events: none. Cheap to keep
+  // enabled; flip to false if you'd rather not pay the periodic scan.
+  const DETECT_POINTER_EVENTS_OVERLAYS = true;
+  const OVERLAY_SCAN_MS = 1000;
+  const OVERLAY_SCAN_BUDGET_MS = 2;    // max time per frame spent on that scan (it's spread over several frames)
+
+  // A pointer-events:none candidate wider/taller than this fraction of the
+  // viewport is treated as a layout wrapper, not a real cover. Twitch's
+  // tooltip/toast/drag layers are exactly this: full-screen, transparent,
+  // and they would otherwise "occlude" every emote on the page.
+  const OVERLAY_MAX_VIEWPORT_FRACTION = 0.9;
 
   const URL_PATTERNS = [
     { name: 'twitch', re: /static-cdn\.jtvnw\.net\/emoticons\/v2\/([^/]+)\// },
@@ -179,6 +238,20 @@
     return state;
   }
 
+  // v2.4.1: a few emotes come back from ImageDecoder with image.duration
+  // of 0/undefined/NaN on some or all frames. Those collapsed
+  // totalDuration, so currentFrameIndex() swept the whole animation in a
+  // few milliseconds and the emote looked like it was vibrating between a
+  // couple of frames. Browsers apply the same kind of floor to their own
+  // native GIF playback, so this doesn't change how a well-formed emote
+  // plays back — it only rescues malformed ones.
+  function sanitizeFrameDuration(rawMicroseconds) {
+    let ms = rawMicroseconds ? rawMicroseconds / 1000 : 100;
+    if (!isFinite(ms) || ms <= 0) ms = 100;
+    if (ms < 10) ms = 10;
+    return ms;
+  }
+
   async function decodeInto(state) {
     try {
       if (typeof ImageDecoder === 'undefined') {
@@ -199,7 +272,7 @@
       let total = 0;
       for (let i = 0; i < frameCount; i++) {
         const { image } = await decoder.decode({ frameIndex: i });
-        const durationMs = image.duration ? image.duration / 1000 : 100;
+        const durationMs = sanitizeFrameDuration(image.duration);
         // VideoFrame -> ImageBitmap avoids the pink/white diagonal
         // corruption some animated WebP/GIFs show when a raw WebCodecs
         // VideoFrame is drawn straight onto a 2D canvas.
@@ -216,7 +289,7 @@
         return;
       }
       state.frames = frames;
-      state.totalDuration = total || 1;
+      state.totalDuration = total > 0 ? total : frames.length * 100;
       state.startTime = performance.now(); // the shared epoch — set exactly once, ever
       state.loading = false;
       if (decoder.close) decoder.close();
@@ -282,17 +355,39 @@
     ctx.imageSmoothingQuality = 'high';
     ensureOverlayLayer().appendChild(canvas);
 
-    // occlusionInsets: undefined = not yet computed (draw unoccluded this
-    // frame); null = fully occluded (hide); {top,bottom} = partial crop.
-    INSTANCES.set(imgEl, {
+    // occlusionInsets: undefined = not yet computed (computed in the next
+    // tick's read phase, before the next paint); null = fully occluded
+    // (hide); {top,bottom} = partial crop.
+    const inst = {
       canvas, ctx, key, hidden: false,
       clipAncestor: undefined, rowRoot: undefined,
       occlusionInsets: undefined,
+      lastOcclusionRect: null,
       bmpW: 0, bmpH: 0,
+      lastFrameIndex: -1,
       lastSrcset: imgEl.getAttribute('srcset'), lastSrc: imgEl.getAttribute('src'),
-    });
-    acquireState(key, upgradeToHighestQuality(url));
-    markOcclusionDirty(); // resync this (and every other) instance's occlusion sooner, not on the slower idle cadence
+    };
+    INSTANCES.set(imgEl, inst);
+
+    // acquireState returns the *existing* shared state untouched when this
+    // emote is already on screen, which is what preserves the clock.
+    const state = acquireState(key, upgradeToHighestQuality(url));
+
+    // v2.4.2: no synchronous occlusion check here any more. It forced a
+    // layout inside the MutationObserver callback, interleaved with the
+    // DOM writes above, once per attached emote (layout thrashing during
+    // a burst). It also never made the canvas show up sooner: drawing only
+    // happens in tick(), which runs before the next paint and computes
+    // this instance's occlusion in its read-only phase.
+
+    // v2.4.0: if the shared state is already decoded, hide the native
+    // <img> *now*, in the same task as the DOM insertion, so a repeat
+    // instance never shows Twitch's own native animation (starting at its
+    // own frame 0) before our canvas draws it on the shared clock.
+    if (state.frames && !state.loading && !state.failed && !state.staticOnly) {
+      imgEl.style.opacity = '0';
+      inst.hidden = true;
+    }
   }
 
   function detachInstance(imgEl) {
@@ -329,6 +424,20 @@
     return node.parentElement === clipAncestor ? node : null;
   }
 
+  // v2.4.2: set of every instance's rowRoot, rebuilt each occlusion sweep.
+  // A DOM change entirely inside one of these can't introduce a foreign
+  // cover (by definition, everything inside a rowRoot counts as "visible"
+  // to the occlusion test) — it can only move rows, which the per-emote
+  // move check already catches. Used to avoid forcing FULL re-samples on
+  // every new chat message.
+  let knownRowRoots = new Set();
+  function isInsideKnownRow(node) {
+    for (const root of knownRowRoots) {
+      if (root === node || root.contains(node)) return true;
+    }
+    return false;
+  }
+
   // ---- DOM scanning ------------------------------------------------------
 
   function maybeAttach(imgEl) {
@@ -338,20 +447,56 @@
 
   function scanNode(node) {
     if (!(node instanceof Element)) return;
+    if (node === overlayLayer) return;
     if (node.tagName === 'IMG') maybeAttach(node);
     if (node.querySelectorAll) node.querySelectorAll('img').forEach(maybeAttach);
+  }
+
+  // v2.4.2: look up only the <img>s inside the removed subtree, instead of
+  // testing every tracked instance with contains() for every removed node.
+  function detachRemoved(node) {
+    if (!(node instanceof Element) || node === overlayLayer || INSTANCES.size === 0) return;
+    const imgs = node.tagName === 'IMG' ? [node] : Array.from(node.getElementsByTagName('img'));
+    for (const img of imgs) {
+      if (!INSTANCES.has(img)) continue;
+      detachInstance(img);
+      // Moved rather than removed (removed + re-inserted in the same
+      // batch): re-attach so clipAncestor/rowRoot are recomputed for its
+      // new position. The shared state (and its clock) is reused as-is.
+      if (img.isConnected) maybeAttach(img);
+    }
+  }
+
+  function hasElementNode(nodeList) {
+    for (let i = 0; i < nodeList.length; i++) if (nodeList[i].nodeType === 1) return true;
+    return false;
+  }
+
+  // Could this mutation have put something new on top of (or taken
+  // something off of) an emote without the emote itself moving? Only
+  // element additions/removals outside the chat rows can. src/srcset
+  // attribute swaps and text-node churn can't change layering.
+  function mutationMayChangeLayering(m) {
+    if (m.type !== 'childList') return false;
+    if (!hasElementNode(m.addedNodes) && !hasElementNode(m.removedNodes)) return false;
+    return !isInsideKnownRow(m.target);
   }
 
   function startObserving() {
     new MutationObserver((mutations) => {
       for (const m of mutations) {
-        if (m.addedNodes) m.addedNodes.forEach(scanNode);
-        if (m.removedNodes) m.removedNodes.forEach((node) => {
-          if (!(node instanceof Element)) return;
-          if (node.tagName === 'IMG' && INSTANCES.has(node)) detachInstance(node);
-          INSTANCES.forEach((inst, imgEl) => { if (node.contains(imgEl)) detachInstance(imgEl); });
-        });
-        if (m.type === 'attributes' && m.target instanceof HTMLImageElement) {
+        // v2.4.2: our own canvases being appended to / removed from the
+        // overlay layer are not page changes — ignore them entirely.
+        // Previously every attach re-triggered this observer and marked
+        // the occlusion sweep dirty.
+        if (m.target === overlayLayer) continue;
+
+        if (!occlusionDirty && mutationMayChangeLayering(m)) markOcclusionDirty();
+
+        if (m.type === 'childList') {
+          m.addedNodes.forEach(scanNode);
+          m.removedNodes.forEach(detachRemoved);
+        } else if (m.type === 'attributes' && m.target instanceof HTMLImageElement) {
           const imgEl = m.target;
           const existing = INSTANCES.get(imgEl);
           const newKey = liveKeyFor(imgEl);
@@ -383,13 +528,125 @@
     return state.frames.length - 1;
   }
 
+  // ---- Pointer-events-aware overlay candidates ----------------------------
+  //
+  // document.elementFromPoint() honours pointer-events, so a pinned banner
+  // (or its wrapper) that sets pointer-events: none is completely invisible
+  // to the occlusion test below — the sample point falls through to the
+  // chat row underneath, `boundary.contains(hit)` returns true, and the
+  // canvas draws straight over the banner. This scan collects those
+  // overlays so they can be ORed into the sample test.
+  //
+  // v2.4.2: the scan used to walk the whole page (getComputedStyle on
+  // thousands of elements) inside one frame, once a second — a visible
+  // hitch in fast chat. It now walks a snapshot of the page a slice at a
+  // time, at most OVERLAY_SCAN_BUDGET_MS per frame, and swaps the result
+  // in when complete. Same filters, same result.
+
+  let overlayCandidates = [];
+  let lastOverlayScan = -Infinity;
+  let scanList = null;
+  let scanIndex = 0;
+  let scanOut = null;
+
+  // v2.4.1: an element can only *cover* an emote if it actually paints
+  // something. Twitch mounts several full-viewport, fixed,
+  // pointer-events:none containers that are pure layout scaffolding for
+  // tooltips/toasts/drag previews; they paint nothing, but geometrically
+  // they sit over every emote on screen.
+  function paintsSomething(cs) {
+    if (cs.backgroundImage && cs.backgroundImage !== 'none') return true;
+    const bg = cs.backgroundColor;
+    if (!bg || bg === 'transparent') return false;
+    const m = bg.match(/^rgba?\(([^)]+)\)/i);
+    if (!m) return false;
+    const parts = m[1].split(',').map((s) => parseFloat(s));
+    const alpha = parts.length >= 4 ? parts[3] : 1;
+    return isFinite(alpha) && alpha > 0.05;
+  }
+
+  function isOverlayCandidate(el) {
+    // v2.4.1: never our own overlay layer or its canvases (self-occlusion).
+    if (el === overlayLayer || (overlayLayer && el.parentElement === overlayLayer)) return false;
+    if (!el.isConnected) return false;
+    const cs = getComputedStyle(el);
+    // Only out-of-flow overlays: anything static that overlaps is already
+    // reported by elementFromPoint.
+    if (cs.position !== 'fixed' && cs.position !== 'sticky') return false;
+    // pointer-events:auto elements are already visible to elementFromPoint.
+    if (cs.pointerEvents !== 'none') return false;
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    // A transparent wrapper can't visually cover anything.
+    return paintsSomething(cs);
+  }
+
+  function sameElementList(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function stepOverlayScan(now) {
+    if (!DETECT_POINTER_EVENTS_OVERLAYS) return;
+    if (!scanList) {
+      if (now - lastOverlayScan < OVERLAY_SCAN_MS) return;
+      lastOverlayScan = now;
+      scanList = document.body.querySelectorAll('*'); // static snapshot
+      scanIndex = 0;
+      scanOut = [];
+    }
+    const deadline = performance.now() + OVERLAY_SCAN_BUDGET_MS;
+    const len = scanList.length;
+    while (scanIndex < len) {
+      if ((scanIndex & 63) === 0 && performance.now() > deadline) return; // continue next frame
+      const el = scanList[scanIndex++];
+      if (isOverlayCandidate(el)) scanOut.push(el);
+    }
+    // Scan complete — swap in. If the set of covers changed, stationary
+    // emotes need a full re-sample (a cover can appear without any emote
+    // moving).
+    if (!sameElementList(overlayCandidates, scanOut)) markOcclusionDirty();
+    overlayCandidates = scanOut;
+    scanList = null;
+    scanOut = null;
+  }
+
+  // Candidate rects are read once per frame and shared by every emote's
+  // occlusion test (previously re-read per emote). Reset at tick start.
+  let frameOverlayRects = null;
+
+  // Returns an array of client rects for the overlay candidates that could
+  // legitimately cover imgEl (i.e. are not an ancestor or descendant of it
+  // — those can't "cover" it in the sense we care about).
+  function activeOverlayRects(imgEl) {
+    if (!overlayCandidates.length) return null;
+    if (frameOverlayRects === null) {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      frameOverlayRects = [];
+      for (const el of overlayCandidates) {
+        if (!el.isConnected) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) continue;
+        // v2.4.1: a candidate that spans essentially the whole viewport is
+        // a page-level scrim/wrapper, not a pinned banner.
+        if (r.width >= vw * OVERLAY_MAX_VIEWPORT_FRACTION && r.height >= vh * OVERLAY_MAX_VIEWPORT_FRACTION) continue;
+        frameOverlayRects.push({ el, r });
+      }
+    }
+    let rects = null;
+    for (const { el, r } of frameOverlayRects) {
+      if (el.contains(imgEl) || imgEl.contains(el)) continue;
+      (rects || (rects = [])).push(r);
+    }
+    return rects;
+  }
+
   // ---- Occlusion (partial-crop, not a boolean) ----------------------------
   //
-  // Samples a handful of points down the emote's own rect, throttled to a
-  // few times a second. Returns how much to inset from the top/bottom, not
-  // just whether "most" of it is covered — a majority-vote boolean lets an
-  // emote draw in full over a banner whenever less than half the sample
-  // points happen to be covered.
+  // Samples a handful of points down the emote's own rect. Returns how much
+  // to inset from the top/bottom, not just whether "most" of it is covered
+  // — a majority-vote boolean lets an emote draw in full over a banner
+  // whenever less than half the sample points happen to be covered.
 
   function computeOcclusionInsets(imgEl, rowRoot, rect) {
     const vw = window.innerWidth, vh = window.innerHeight;
@@ -397,11 +654,25 @@
     if (x < 0 || x >= vw) return { top: 0, bottom: 0 };
 
     const boundary = rowRoot || imgEl;
+    const overlays = activeOverlayRects(imgEl);
     let visTop = null, visBottom = null;
+    let sampled = 0;
     for (let i = 0; i < OCCLUSION_SAMPLES; i++) {
       const frac = OCCLUSION_EDGE_INSET + (1 - 2 * OCCLUSION_EDGE_INSET) * (i / (OCCLUSION_SAMPLES - 1));
       const y = rect.top + rect.height * frac;
       if (y < 0 || y >= vh) continue;
+      sampled++;
+
+      // A pointer-events: none overlay won't be reported by
+      // elementFromPoint, so test it geometrically first.
+      if (overlays) {
+        let covered = false;
+        for (const r of overlays) {
+          if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) { covered = true; break; }
+        }
+        if (covered) continue;
+      }
+
       const hit = document.elementFromPoint(x, y);
       // "Visible" = hit lands inside this element's own row subtree (or is
       // an ancestor of it, i.e. plain background) — not necessarily on
@@ -410,33 +681,75 @@
       const visible = !!hit && (boundary === hit || boundary.contains(hit) || hit.contains(boundary));
       if (visible) { if (visTop === null) visTop = y; visBottom = y; }
     }
-    if (visTop === null) return null; // fully occluded
+    // v2.4.1: if no sample point was even testable (every y fell outside
+    // the viewport), that's "we don't know", not "fully covered".
+    if (visTop === null) return sampled === 0 ? { top: 0, bottom: 0 } : null;
     return { top: Math.max(0, visTop - rect.top), bottom: Math.max(0, rect.bottom - visBottom) };
   }
 
-  let lastOcclusionCheck = -Infinity;
-  let occlusionDirty = false;
+  let lastFullOcclusion = -Infinity;
+  let occlusionDirty = true;
   const markOcclusionDirty = () => { occlusionDirty = true; };
 
+  const snapRect = (r) => ({ top: r.top, left: r.left, width: r.width, height: r.height });
+  function sameRect(last, r) {
+    return !!last &&
+      Math.abs(r.top - last.top) < 0.5 &&
+      Math.abs(r.left - last.left) < 0.5 &&
+      Math.abs(r.width - last.width) < 0.5 &&
+      Math.abs(r.height - last.height) < 0.5;
+  }
+
+  // v2.4.2: two independent triggers, so fast chat no longer means "full
+  // re-sample every frame":
+  //   - MOVED emotes (rect changed since their last sample) are re-sampled
+  //     every frame, immediately. Chat scrolling a row up under the pinned
+  //     message is caught the same frame it happens.
+  //   - A FULL re-sample of stationary emotes happens when something
+  //     outside the chat rows changed (dirty), at most every
+  //     OCCLUSION_DIRTY_MIN_MS, plus a safety-net every OCCLUSION_REFRESH_MS.
   function updateOcclusion(now) {
-    const minInterval = occlusionDirty ? OCCLUSION_DIRTY_MIN_MS : OCCLUSION_REFRESH_MS;
-    if (now - lastOcclusionCheck < minInterval) return;
-    occlusionDirty = false;
-    lastOcclusionCheck = now;
+    stepOverlayScan(now);
+
+    let full = false;
+    if (now - lastFullOcclusion >= OCCLUSION_REFRESH_MS) full = true;
+    else if (occlusionDirty && now - lastFullOcclusion >= OCCLUSION_DIRTY_MIN_MS) full = true;
+    if (full) { occlusionDirty = false; lastFullOcclusion = now; }
+
     const vw = window.innerWidth, vh = window.innerHeight;
+    const roots = new Set();
 
     for (const [imgEl, inst] of INSTANCES) {
-      if (!document.body.contains(imgEl)) continue;
-      const rect = imgEl.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) { inst.occlusionInsets = null; continue; }
-      if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { inst.occlusionInsets = { top: 0, bottom: 0 }; continue; }
+      if (!imgEl.isConnected) continue;
+      if (inst.rowRoot) roots.add(inst.rowRoot);
 
-      if (!inst.clipAncestor || !document.body.contains(inst.clipAncestor)) inst.clipAncestor = findScrollClipAncestor(imgEl);
-      if (inst.rowRoot === undefined || (inst.rowRoot && !document.body.contains(inst.rowRoot))) {
+      const rect = imgEl.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) {
+        inst.occlusionInsets = null;
+        inst.lastOcclusionRect = null;
+        continue;
+      }
+      if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+        inst.occlusionInsets = { top: 0, bottom: 0 };
+        inst.lastOcclusionRect = snapRect(rect);
+        continue;
+      }
+
+      if (!full && inst.occlusionInsets !== undefined && sameRect(inst.lastOcclusionRect, rect)) {
+        continue; // hasn't moved and no full re-sample due — keep cached insets
+      }
+
+      inst.lastOcclusionRect = snapRect(rect);
+
+      if (!inst.clipAncestor || !inst.clipAncestor.isConnected) inst.clipAncestor = findScrollClipAncestor(imgEl);
+      if (inst.rowRoot === undefined || (inst.rowRoot && !inst.rowRoot.isConnected)) {
         inst.rowRoot = findRowRoot(imgEl, inst.clipAncestor);
       }
+      if (inst.rowRoot) roots.add(inst.rowRoot);
       inst.occlusionInsets = computeOcclusionInsets(imgEl, inst.rowRoot, rect);
     }
+
+    knownRowRoots = roots;
   }
 
   // Combines the scroll-ancestor clip with the occlusion insets into one
@@ -462,20 +775,21 @@
 
   function tick() {
     const now = performance.now();
+    frameOverlayRects = null;
     updateOcclusion(now);
     const vw = window.innerWidth, vh = window.innerHeight;
+    const clipRectCache = new Map(); // one getBoundingClientRect per scroll ancestor per frame
 
     // Phase 1 (read-only): batch every getBoundingClientRect() up front so
     // the browser does one layout pass instead of thrashing between reads
     // and the style writes in phase 2.
     const work = [];
     for (const [imgEl, inst] of INSTANCES) {
-      if (!document.body.contains(imgEl)) { work.push({ inst, imgEl, action: 'detach' }); continue; }
+      if (!imgEl.isConnected) { work.push({ inst, imgEl, action: 'detach' }); continue; }
 
       // Cheap per-frame safety net alongside the MutationObserver: if
       // src/srcset changed since we last checked and it resolves to a
-      // *different* known emote, resync. Reading two attributes here is
-      // far cheaper than a getComputedStyle call, so this runs unthrottled.
+      // *different* known emote, resync.
       const ss = imgEl.getAttribute('srcset');
       const sa = imgEl.getAttribute('src');
       if (ss !== inst.lastSrcset || sa !== inst.lastSrc) {
@@ -492,18 +806,28 @@
       if (rect.width === 0 || rect.height === 0) { work.push({ inst, imgEl, action: 'hide' }); continue; }
       if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
-      // A brand-new instance hasn't had an occlusion pass run for it yet
-      // (occlusionInsets is still undefined). Fall back to the native
-      // <img> rather than assuming "not occluded" and drawing at full
-      // size/position — during fast-moving chat, many instances attach in
-      // the same burst, and defaulting to "fully visible" was letting
-      // each one draw unclipped for up to ~200ms, which looked like
-      // emotes briefly overlapping before self-correcting.
-      if (inst.occlusionInsets === undefined) { work.push({ inst, imgEl, action: 'hide' }); continue; }
+      // Safety net: an instance attached after updateOcclusion() ran this
+      // frame has no occlusion result yet. Compute it here (read-only, safe
+      // inside phase 1) instead of falling back to the unsynced native <img>.
+      if (inst.occlusionInsets === undefined) {
+        if (!inst.clipAncestor || !inst.clipAncestor.isConnected) {
+          inst.clipAncestor = findScrollClipAncestor(imgEl);
+          inst.rowRoot = findRowRoot(imgEl, inst.clipAncestor);
+        } else if (inst.rowRoot === undefined || (inst.rowRoot && !inst.rowRoot.isConnected)) {
+          inst.rowRoot = findRowRoot(imgEl, inst.clipAncestor);
+        }
+        inst.occlusionInsets = computeOcclusionInsets(imgEl, inst.rowRoot, rect);
+        inst.lastOcclusionRect = snapRect(rect);
+      }
       const insets = inst.occlusionInsets;
       if (insets === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
-      const cRect = (inst.clipAncestor && document.body.contains(inst.clipAncestor)) ? inst.clipAncestor.getBoundingClientRect() : null;
+      let cRect = null;
+      const ca = inst.clipAncestor;
+      if (ca && ca.isConnected) {
+        cRect = clipRectCache.get(ca);
+        if (!cRect) { cRect = ca.getBoundingClientRect(); clipRectCache.set(ca, cRect); }
+      }
       const clipPath = computeClipPath(rect, cRect, insets);
       if (clipPath === null) { work.push({ inst, imgEl, action: 'hide' }); continue; }
 
@@ -543,35 +867,54 @@
       if (canvas.style.height !== hPx) canvas.style.height = hPx;
       if (canvas.style.clipPath !== clipPath) canvas.style.clipPath = clipPath;
 
-      const frame = state.frames[currentFrameIndex(state, frameNow)].bitmap;
+      const frameIndex = currentFrameIndex(state, frameNow);
+      const frame = state.frames[frameIndex].bitmap;
 
       // Canvas pixel buffer only needs to match the decoded bitmap's own
       // resolution (rare to change) — CSS width/height above handles
-      // scaling to the on-screen size every frame without touching (and
-      // clearing) the backing pixel buffer on every tick.
+      // scaling to the on-screen size.
       if (inst.bmpW !== frame.width || inst.bmpH !== frame.height) {
         canvas.width = frame.width;
         canvas.height = frame.height;
         inst.bmpW = frame.width;
         inst.bmpH = frame.height;
+        inst.lastFrameIndex = -1; // resizing clears the buffer
       }
 
-      const ctx = inst.ctx;
-      ctx.clearRect(0, 0, inst.bmpW, inst.bmpH);
-      try {
-        ctx.drawImage(frame, 0, 0);
-        if (canvas.style.display !== '') canvas.style.display = '';
-      } catch (e) {
-        // Never show a garbled/blank frame — hide the canvas AND restore
-        // the native <img> so the emote stays visible (just unsynced)
-        // rather than disappearing entirely if this keeps failing.
-        canvas.style.display = 'none';
-        imgEl.style.opacity = '';
-        inst.hidden = false;
+      // v2.4.2: the canvas keeps its pixels between frames, so only
+      // repaint when the shared clock has actually advanced to a new frame.
+      if (frameIndex !== inst.lastFrameIndex) {
+        const ctx = inst.ctx;
+        ctx.clearRect(0, 0, inst.bmpW, inst.bmpH);
+        try {
+          ctx.drawImage(frame, 0, 0);
+          inst.lastFrameIndex = frameIndex;
+        } catch (e) {
+          // Never show a garbled/blank frame — hide the canvas AND restore
+          // the native <img> so the emote stays visible (just unsynced).
+          canvas.style.display = 'none';
+          imgEl.style.opacity = '';
+          inst.hidden = false;
+          inst.lastFrameIndex = -1;
+          continue;
+        }
       }
+      if (canvas.style.display !== '') canvas.style.display = '';
     }
 
     requestAnimationFrame(tick);
+  }
+
+  // UI events that might put something over an emote without moving it
+  // (a popover opening, a banner finishing its slide-in). Ignored when the
+  // event happened inside a chat row — hover highlights, 7TV/FFZ row
+  // animations and the like can't cover another emote, and in fast chat
+  // they fire constantly.
+  function onUiEvent(e) {
+    if (occlusionDirty) return;
+    const t = e.target;
+    if (t instanceof Node && isInsideKnownRow(t)) return;
+    markOcclusionDirty();
   }
 
   function boot() {
@@ -579,11 +922,14 @@
     document.querySelectorAll('img').forEach(maybeAttach);
     startObserving();
 
-    document.addEventListener('click', markOcclusionDirty, { capture: true, passive: true });
-    document.addEventListener('transitionend', markOcclusionDirty, { capture: true, passive: true });
-    document.addEventListener('animationend', markOcclusionDirty, { capture: true, passive: true });
+    document.addEventListener('click', onUiEvent, { capture: true, passive: true });
+    document.addEventListener('transitionend', onUiEvent, { capture: true, passive: true });
+    document.addEventListener('animationend', onUiEvent, { capture: true, passive: true });
     window.addEventListener('resize', markOcclusionDirty, { passive: true });
-    window.addEventListener('scroll', markOcclusionDirty, { capture: true, passive: true });
+    // v2.4.2: no scroll listener any more. Scrolling moves emotes, and moved
+    // emotes are re-sampled every frame by updateOcclusion() on their own.
+    // Marking the sweep dirty on scroll is what forced a full re-sample of
+    // every emote on every frame while chat was auto-scrolling.
 
     requestAnimationFrame(tick);
   }
