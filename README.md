@@ -3,7 +3,7 @@
 **DISCLAIMER! THIS SCRIPT IS STILL A WORK-IN-PROGRESS, BUGS ARE TO BE EXPECTED**
 
 
-Stop animated emotes from restarting when the same emote is posted again.
+Personal project.
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.4.2-red.svg)](https://greasyfork.org/)
@@ -13,7 +13,7 @@ Stop animated emotes from restarting when the same emote is posted again.
 
 ## Overview
 
-This userscript fixes a long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat.
+This userscript fixes my long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat.
 
 Normally, when someone sends an animated emote like `LOL` and another person sends `LOL` a second later:
 
