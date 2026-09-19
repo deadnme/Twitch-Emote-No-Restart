@@ -6,7 +6,6 @@
 // @author       Sirsane2k
 // @license      GNU GPLv3
 // @match        https://www.twitch.tv/*
-// @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      static-cdn.jtvnw.net
 // @connect      cdn.7tv.app
