@@ -6,6 +6,7 @@
 // @author       Sirsane2k
 // @license      GNU GPLv3
 // @match        https://www.twitch.tv/*
+// @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      static-cdn.jtvnw.net
 // @connect      cdn.7tv.app
@@ -25,14 +26,52 @@
 // GIF/WebP/APNG independently via the browser's native image decoder, and
 // Twitch's own DOM churn (new message -> reflow/recycle) restarts them.
 //
-// THE FIX: never let the browser animate the <img> itself. Decode each
-// unique emote once into a plain frame array, keep ONE shared virtual
-// "clock" per emote (an epoch timestamp), and paint that same frame into
-// a canvas laid over every on-screen copy. Adding a new copy only ever
-// reads the existing clock — it can't rewind it, and it can't be rewound
-// by anything Twitch does to the DOM, because the canvases live in a
-// persistent overlay layer on document.body, independent of whatever
-// <img> nodes Twitch creates, destroys, or recycles underneath them.
+//
+// Drift happens when the rAF loop misses frames: the <img> is real DOM and
+// moves with every paint as chat scrolls, while the canvas only catches up
+// when tick() next runs. So the fix is to keep the frame budget free.
+//   (1) v2.4.2 meant to stop new chat messages from forcing a full occlusion
+//       re-sample, but mutationMayChangeLayering() only excluded mutations
+//       whose target was INSIDE a chat row. A new message is appended to the
+//       row *list*, so the target is the scroll container -- outside every
+//       rowRoot -- and every single message still marked the sweep dirty.
+//       Tracked clip ancestors are now excluded too. (Measured on a 20 msg/s
+//       harness: ~7900 forced elementFromPoint hit-tests per second, gone.)
+//   (2) Occlusion sampling is capped at OCCLUSION_BUDGET_MS per frame and
+//       round-robins across frames. This is what makes drift impossible under
+//       load: an emote that misses the cap keeps its cached insets but is
+//       STILL repositioned from its fresh rect, so the canvas cannot fall
+//       behind its <img>. Only the crop goes briefly stale.
+//   (3) An emote is only hit-tested when it actually overlaps something
+//       out-of-flow that paints. Clipping by the scroll container was always
+//       pure geometry (computeClipPath's cRect) and never needed a hit-test;
+//       the samples are only for foreign covers. ~75% of samples now skip.
+//   (4) The pointer-events overlay scan no longer re-walks the whole page.
+//       It stamped its timer at the *start* of a scan, so by the time a long
+//       scan finished the next was already due -- a permanent ~2ms/frame tax
+//       that grew with page size. Candidacy is now driven off the
+//       MutationObserver, with a rare full rescan as a safety net.
+//       (~6700 getComputedStyle calls/second -> a few hundred.)
+//   (5) currentFrameIndex() is resolved once per emote per frame over
+//       precomputed cumulative offsets, not once per on-screen copy via a
+//       linear scan. Every copy shares one clock, so the value was identical.
+//   (6) One getBoundingClientRect per instance per frame, shared between the
+//       occlusion pass and the draw pass (each used to take its own).
+//   (7) Decodes are queued at DECODE_CONCURRENCY instead of all starting at
+//       once when a burst of unseen emotes arrives.
+//   (8) The transform write is guarded like the width/height/clipPath writes.
+//
+// Also fixed, and unrelated to speed:
+//   (9) computeOcclusionInsets() turned sample POSITIONS into crop insets,
+//       and the outermost samples sit OCCLUSION_EDGE_INSET (8%) inside the
+//       emote to avoid row-seam false positives. So every animated emote was
+//       cropped 8% off the top and 8% off the bottom -- 16% of a 28px chat
+//       emote -- even with nothing whatsoever covering it. An edge whose
+//       outermost sample is visible now gets a zero inset.
+//  (10) upgradeToHighestQuality() anchors every pattern with $, but Twitch
+//       serves emote URLs with a "#e=0" fragment, so every pattern missed and
+//       the function returned the 1.0 (28px) variant it was written to avoid.
+//       Any #fragment / ?query is now set aside before matching.
 // ---------------------------------------------------------------------
 
 (function () {
