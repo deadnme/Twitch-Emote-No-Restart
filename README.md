@@ -11,7 +11,7 @@ Personal project.
 
 ## Overview
 
-This userscript fixes my long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat.
+This userscript fixes my long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat. Posted here just in case somebody else has the same problem.
 
 Normally, when someone sends an animated emote like `LOL` and another person sends `LOL` a second later:
 
