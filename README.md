@@ -6,7 +6,7 @@
 Personal project.
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.5.1-red.svg)](https://greasyfork.org/)
+[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.5.2-red.svg)](https://greasyfork.org/)
 
 
 ---
