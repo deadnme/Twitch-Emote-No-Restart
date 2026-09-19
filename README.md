@@ -1,7 +1,5 @@
 # Twitch Emote No-Restart
 
-**DISCLAIMER! THIS SCRIPT IS STILL A WORK-IN-PROGRESS, BUGS ARE TO BE EXPECTED**
-
 
 Personal project.
 
