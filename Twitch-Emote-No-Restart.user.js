@@ -26,6 +26,22 @@
 // GIF/WebP/APNG independently via the browser's native image decoder, and
 // Twitch's own DOM churn (new message -> reflow/recycle) restarts them.
 //
+// THE FIX: never let the browser animate the <img> itself. Decode each
+// unique emote once into a plain frame array, keep ONE shared virtual
+// "clock" per emote (an epoch timestamp), and paint that same frame into
+// a canvas laid over every on-screen copy. Adding a new copy only ever
+// reads the existing clock — it can't rewind it, and it can't be rewound
+// by anything Twitch does to the DOM, because the canvases live in a
+// persistent overlay layer on document.body, independent of whatever
+// <img> nodes Twitch creates, destroys, or recycles underneath them.
+//
+// v2.3.0 / v2.4.0 / v2.4.1: occlusion (pinned Predict banner, pinned chat
+// message, sticky header ...) via elementFromPoint sampling + a scan for
+// pointer-events:none overlays; immediate native-<img> hide for repeat
+// instances; self-occlusion / invisible-wrapper / bogus-duration fixes.
+//
+// v2.5.0: the canvas drifting out of position during fast chat, plus a
+// rendering bug that had been cropping every animated emote.
 //
 // Drift happens when the rAF loop misses frames: the <img> is real DOM and
 // moves with every paint as chat scrolls, while the canvas only catches up
@@ -72,6 +88,45 @@
 //       serves emote URLs with a "#e=0" fragment, so every pattern missed and
 //       the function returned the 1.0 (28px) variant it was written to avoid.
 //       Any #fragment / ?query is now set aside before matching.
+//
+// v2.4.2: fixes emotes lagging behind during very fast chat. Nothing about
+// decoding, image quality, the shared clock or occlusion *results* changed
+// — only how often and when the expensive work runs.
+//   (1) The occlusion sweep was effectively running a FULL re-sample of
+//       every emote on every frame in fast chat: every DOM mutation,
+//       scroll, transitionend and animationend set the dirty flag, and a
+//       dirty sweep bypassed the "hasn't moved, keep cached insets" check
+//       (the opposite of what its comment said). That is 5 forced
+//       elementFromPoint hit-tests per emote per frame. Now:
+//         - an emote whose rect moved is re-sampled that same frame (so a
+//           row scrolling up under the pinned message is clipped exactly
+//           as before, with no delay);
+//         - a FULL re-sample of stationary emotes only happens when
+//           something OUTSIDE the chat rows changed (a banner / pinned
+//           message mounting, a popover, a resize), capped at one per
+//           OCCLUSION_DIRTY_MIN_MS, plus a safety-net full sweep every
+//           OCCLUSION_REFRESH_MS. New chat messages only move rows, which
+//           the per-emote move check already handles.
+//   (2) Our own canvases being appended to the overlay layer triggered the
+//       MutationObserver, which marked the sweep dirty on every attach.
+//       Mutations inside our overlay layer are now ignored.
+//   (3) The pointer-events overlay scan did querySelectorAll('*') plus
+//       getComputedStyle on the ENTIRE page in a single frame once a
+//       second — a periodic hitch that grows with chat size. It is now
+//       time-sliced (OVERLAY_SCAN_BUDGET_MS per frame). Same checks, same
+//       results, spread over a few frames.
+//   (4) attachInstance forced a synchronous layout (getBoundingClientRect
+//       + elementFromPoint) inside the MutationObserver callback, between
+//       DOM writes — N forced layouts for a burst of N emotes. That check
+//       never made the canvas appear sooner (drawing only happens in
+//       tick(), which always runs before the next paint), so the new
+//       instance's occlusion is now computed in tick()'s read phase.
+//   (5) Removed chat rows were checked against EVERY tracked instance with
+//       contains(). Now only the <img>s inside the removed subtree are
+//       looked up.
+//   (6) Every canvas was cleared + redrawn every frame even when the
+//       shared clock was still on the same frame. The redraw is skipped
+//       when the frame index hasn't changed (pixels are identical).
 // ---------------------------------------------------------------------
 
 (function () {
