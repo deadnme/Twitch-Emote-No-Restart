@@ -3,7 +3,7 @@
 // @namespace    twitch-emote-no-restart
 // @version      2.5.1
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
-// @author       Sirsane2k
+// @author       deadnme
 // @license      GNU GPLv3
 // @match        https://www.twitch.tv/*
 // @run-at       document-idle
