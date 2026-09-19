@@ -1,7 +1,7 @@
 # Twitch Emote No-Restart
 
 
-Personal project.
+Posted just in case somebody else has the same problem. Personal project. 
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.5.2-red.svg)](https://greasyfork.org/)
@@ -10,8 +10,6 @@ Personal project.
 ---
 
 ## Overview
-
-Posted here just in case somebody else has the same problem.
 
 
 This userscript fixes my long-standing Twitch chat annoyance: animated emotes (from Twitch, 7TV, BetterTTV, and FrankerFaceZ) restarting or flickering whenever the same emote is posted again in chat. 
