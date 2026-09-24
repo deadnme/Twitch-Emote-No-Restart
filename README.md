@@ -4,7 +4,7 @@
 Posted just in case somebody else has the same problem. Personal project. 
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.6.0-red.svg)](https://greasyfork.org/)
+[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.6.1-red.svg)](https://greasyfork.org/)
 
 
 ---
@@ -70,7 +70,8 @@ No configuration is needed. The script:
 - Automatically detects animated emotes from **Twitch**, **7TV**, **BetterTTV**, and **FrankerFaceZ**.
 - Creates a single shared animation state per unique emote.
 - Renders all instances of that emote from the same frame, on the same clock.
-- Cleans up decoded frames from memory ~15 seconds after the last instance disappears.
+- Draws the frames from a background worker, so emotes keep animating through Twitch's brief page freezes, just like normal images do.
+- Cleans up decoded frames from memory ~15 seconds after the last instance disappears, and caps them at 192 MB (only emotes that are off screen are ever freed).
 
 ### Supported Emote Providers
 
@@ -88,6 +89,19 @@ Requires a browser with **WebCodecs `ImageDecoder`** support:
 - ✅ Safari 16.4+
 
 If `ImageDecoder` is unavailable, the script silently disables itself and Twitch's default emote rendering takes over — no breakage.
+
+---
+
+## Changelog
+
+### 2.6.1
+
+- Rewritten to be much smaller (1,927 → ~700 lines) with the same behaviour. The backup renderer used when a background worker can't start is now the worker's own code running on the page, instead of a second copy of everything.
+- Fixed: during a heavy flood of many different emotes, a reused canvas could briefly show the **previous** emote (about 1 in 4 canvases in testing), and emotes freed to save memory could come back **blank**. Both are gone.
+- Fixed: an emote could stay blurry in the enlarged hover preview if a sharper version was requested while another was still loading.
+- Tested with real 7TV, BetterTTV and FrankerFaceZ animated emotes spammed at up to 60 messages per second, alongside the existing test suite.
+
+Older release notes are in the commit history.
 
 ---
 
