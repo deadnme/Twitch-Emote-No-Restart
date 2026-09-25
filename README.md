@@ -126,4 +126,4 @@ Please include:
 
 ## Support Author
 
-If you like this script, you can [buy me a coffee ☕](https://ko-fi.com/sirsane2k)
+If you like this script, you can [buy me a coffee ☕](https://ko-fi.com/deadnme)
