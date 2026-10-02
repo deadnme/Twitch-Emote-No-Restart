@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Emote No-Restart
 // @namespace    twitch-emote-no-restart
-// @version      2.6.4
+// @version      2.6.5
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
 // @author       deadnme
 // @license      GNU GPLv3
@@ -172,7 +172,6 @@
       if (w === inst.canvas.width && h === inst.canvas.height) return;
       inst.canvas.width = w; inst.canvas.height = h;
       inst.ctx.imageSmoothingQuality = 'high'; // resizing resets context state
-      inst.ctx.globalCompositeOperation = 'copy'; // drawImage replaces every pixel: no clearRect needed
       inst.fi = -1;
       if (st.frames) paint(inst);
     }
@@ -188,6 +187,7 @@
     function paint(inst, fi = frameAt(inst.st, performance.now())) {
       if (inst.fi === fi) return;
       try {
+        inst.ctx.clearRect(0, 0, inst.canvas.width, inst.canvas.height);
         inst.ctx.drawImage(inst.st.frames[fi], 0, 0, inst.canvas.width, inst.canvas.height);
         inst.fi = fi; framesDrawn++;
       } catch (e) { inst.visible = false; post({ t: 'drawError', id: inst.id }); }
@@ -214,10 +214,7 @@
     port.onmessage = ({ data: m }) => {
       let inst = insts.get(m.id);
       if (m.t === 'bind') {
-        // willReadFrequently keeps each small canvas CPU-rastered: a GPU context per emote meant
-        // per-canvas GPU work and bitmap re-uploads every frame, which lagged with hardware acceleration on.
-        if (!inst) insts.set(m.id, inst = { id: m.id, canvas: m.canvas, ctx: m.canvas.getContext('2d', { willReadFrequently: true }), st: null, reqW: 0, reqH: 0, visible: false, fi: -1 });
-        inst.ctx.globalCompositeOperation = 'copy'; // a canvas size() never resizes still needs it
+        if (!inst) insts.set(m.id, inst = { id: m.id, canvas: m.canvas, ctx: m.canvas.getContext('2d'), st: null, reqW: 0, reqH: 0, visible: false, fi: -1 });
         unbind(inst);
         inst.st = getState(m.key, m.url, m.px);
         inst.st.insts.add(inst);
