@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch Emote No-Restart
 // @namespace    twitch-emote-no-restart
-// @version      2.6.3
+// @version      2.6.4
 // @description  Prevents animated Twitch/7TV/BTTV/FFZ chat emotes from restarting/flickering when a new instance of the same emote is posted. All on-screen copies of an emote share one animation clock.
 // @author       deadnme
 // @license      GNU GPLv3
@@ -320,7 +320,9 @@
   function emoteOf(img) {
     const srcset = (img.getAttribute('srcset') || '').split(',').map((s) => s.trim().split(/\s+/)[0]).reverse();
     const url = [...srcset, img.getAttribute('src'), img.currentSrc].find(keyForUrl);
-    return url ? { url, key: keyForUrl(url) } : null;
+    // Absolute: 7TV's srcset is protocol-relative ("//cdn.7tv.app/..."), which the renderer's
+    // https:// size patterns miss, so it fetched the 4x file instead of the size on screen.
+    return url ? { url: new URL(url, location.href).href, key: keyForUrl(url) } : null;
   }
 
   // Deliberately not limited to chat: a selector allowlist silently broke whenever Twitch's markup

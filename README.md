@@ -4,7 +4,7 @@
 Posted just in case somebody else has the same problem. Personal project. 
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.6.3-red.svg)](https://greasyfork.org/)
+[![Greasy Fork](https://img.shields.io/badge/greasyfork-v2.6.4-red.svg)](https://greasyfork.org/)
 
 
 ---
